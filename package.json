@@ -1,0 +1,65 @@
+{
+  "name": "dsh-plugin-session-delete",
+  "version": "1.1.0",
+  "description": "Delete a Session from the sidebar's \"...\" menu — a destructive row styled with DSH's own MenuItemButton danger colors · 在会话「⋯」菜单末尾添加红色的删除会话选项",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek",
+    "session",
+    "session-delete",
+    "plugin"
+  ],
+  "author": "BillCx330",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BillCx330/dsh-plugin-session-delete.git"
+  },
+  "homepage": "https://github.com/BillCx330/dsh-plugin-session-delete#readme",
+  "bugs": {
+    "url": "https://github.com/BillCx330/dsh-plugin-session-delete/issues"
+  },
+  "engines": {
+    "dsh": ">=0.2.0-rc.2"
+  },
+  "type": "module",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/types/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "types": "./lib/types/client/index.d.ts",
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json",
+    "./cordis.patch.yml": "./cordis.patch.yml"
+  },
+  "files": [
+    "icon.svg",
+    "lib/index.js",
+    "lib/client.js",
+    "lib/types/**/*.d.ts",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "test": "node test/manifest.test.mjs && node test/host.test.mjs && node test/client.test.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ],
+      "platform": "web"
+    }
+  }
+}

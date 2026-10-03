@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" fill="none"
+     stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+  <!-- A session card, marked for removal: the destructive color is supplied by
+       the surface that renders the mark (see lib/client.js). -->
+  <path d="M12 4h5a2 2 0 0 1 2 2v6" />
+  <path d="M4 8h13" />
+  <path d="M6 8v10a2 2 0 0 0 2 2h5" />
+  <path d="M10 12v4" />
+  <path d="M15 17.5 19.5 22" />
+  <path d="M19.5 17.5 15 22" />
+</svg>

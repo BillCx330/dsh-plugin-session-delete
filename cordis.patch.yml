@@ -1,0 +1,10 @@
+# dsh-plugin-session-delete — dsh bundle patch.
+#
+# One row: this package's own Host half. Mounting the row is what makes the
+# package discoverable by the client-module scanner (`dsh.client` is read from
+# the manifest of the package a Loader row mounts), so the browser half — the
+# red "删除会话" row in the Session "..." menu — is served with it.
+
+- insert:
+    - id: session-delete
+      name: 'dsh-plugin-session-delete'

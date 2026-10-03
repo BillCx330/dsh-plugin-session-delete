@@ -1,0 +1,19 @@
+# Build / package manager output
+node_modules/
+*.tgz
+*.tsbuildinfo
+
+# DSH / local runtime leftovers
+.dsh-*
+*.log
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Never commit credentials
+.env
+.env.*
