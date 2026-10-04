@@ -24,14 +24,14 @@ async function seedSession(project, sessionId) {
 }
 
 /** Build a Host context over one fake deployment shape. */
-function makeContext({ live = false, running = false, locate = true, outsidePath } = {}) {
+function makeContext({ live = false, running = false, locate = true, outsidePath, failDetach = false, failUnpin = false } = {}) {
   const state = {
-    deleted: [],
     detached: [],
     unpinned: [],
     unarchived: [],
     emitted: [],
     cacheDropped: [],
+    activityQueries: 0,
     route: undefined,
   }
 
@@ -41,12 +41,10 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
 
   const agents = { get: () => undefined }
 
-  const summaries = [
-    { sessionId: 'session-x', running: false },
-    { sessionId: 'session-live', running: false },
-    { sessionId: 'session-busy', running: true },
-  ]
-  if (running) summaries.find((s) => s.sessionId === 'session-x').running = true
+  // The shipped archive path asks `workspace/session-activity` what is still
+  // running on a Session; the plugin uses that same read-only probe, so the
+  // fake reports through it rather than through a session list.
+  const activityFor = (id) => (running && id === 'session-x' ? [{ kind: 'job', items: [{ id: 'job-1' }] }] : [])
 
   const persistence = {
     root,
@@ -66,6 +64,7 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
 
   const workspaceRegistry = {
     async unpinSession(id) {
+      if (failUnpin) throw new Error('unpin blew up')
       state.unpinned.push(id)
     },
     async unarchiveSession(id) {
@@ -73,9 +72,13 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
     },
     list: () => [
       {
-        workspaceId: 'ws-1',
+        // The real WorkspaceEntity exposes `id`, not `workspaceId` — the fake
+        // mirrors the real shape, so a drift between them fails a test instead
+        // of passing one.
+        id: 'ws-1',
         sessionIds: ['session-x', 'session-live', 'session-busy'],
         async detachSession(id) {
+          if (failDetach) throw new Error('detach blew up')
           state.detached.push(id)
         },
       },
@@ -93,6 +96,11 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
     },
     emit(event, ...args) {
       state.emitted.push([event, ...args])
+    },
+    async waterfall(event, request, next) {
+      state.activityQueries += 1
+      assert.equal(event, 'workspace/session-activity', 'the plugin must ask the shipped activity probe')
+      return activityFor(request.sessionId) ?? (await next())
     },
     get(key) {
       switch (key) {
@@ -118,12 +126,6 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
                   }
                 },
               }
-            },
-          }
-        case 'sessionController':
-          return {
-            async list() {
-              return { items: summaries }
             },
           }
         default:
@@ -267,6 +269,62 @@ async function post(route, body) {
   assert.deepEqual(state.cacheDropped, [], 'a refused removal must not drop the cache row')
 
   await rm(outside, { recursive: true, force: true })
+}
+
+/* --------------------------- partial cleanup is never an error, never silent */
+
+{
+  // The artifact is gone but the workspace detach throws. That must stay a
+  // success: the Session really is deleted, and failing the request is what
+  // leaves the client holding a phantom row for a Session that is gone.
+  const dir = await seedSession('--proj--', 'session-x')
+  const { ctx, state } = makeContext({ failDetach: true })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200, 'a cleanup failure must not turn a real deletion into an error')
+  assert.equal(payload.ok, true)
+  assert.equal(payload.artifactRemoved, true)
+  assert.equal(payload.announced, true, 'the removal must be announced whatever cleanup did')
+  assert.deepEqual(payload.detachedFrom, [], 'a failed detach is not a released account slot')
+  assert.equal(payload.cleanupWarnings.length, 1, 'the cleanup failure must still be reported')
+  assert.match(payload.cleanupWarnings[0], /detach ws-1/u)
+  assert.deepEqual(state.emitted, [['api-session/removed', 'session-x']])
+  await assert.rejects(() => stat(dir), 'the artifact must be gone')
+}
+
+{
+  // An unpin that throws must not stop unarchive/detach from running, and must
+  // not stop the removal from being announced.
+  const dir = await seedSession('--proj--', 'session-x')
+  const { ctx, state } = makeContext({ failUnpin: true })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200)
+  assert.equal(payload.announced, true)
+  assert.deepEqual(state.unarchived, ['session-x'], 'a failed unpin must not skip unarchive')
+  assert.deepEqual(state.detached, ['session-x'], 'a failed unpin must not skip detach')
+  assert.deepEqual(payload.detachedFrom, ['ws-1'], 'detachedFrom must carry the workspace entity id')
+  assert.match(payload.cleanupWarnings[0], /^unpin:/u)
+  await rm(dir, { recursive: true, force: true })
+}
+
+{
+  // The active-work probe is the shipped one, and a reported job blocks the
+  // delete before anything is touched.
+  const dir = await seedSession('--proj--', 'session-x')
+  const { ctx, state } = makeContext({ running: true })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 409)
+  assert.equal(payload.code, 'running')
+  assert.equal(state.activityQueries > 0, true, 'the shipped activity probe must be asked')
+  await stat(dir)
+  assert.deepEqual(state.detached, [])
+  assert.deepEqual(state.emitted, [])
+  await rm(dir, { recursive: true, force: true })
 }
 
 /* ------------------------------------------- nothing else was removed --- */

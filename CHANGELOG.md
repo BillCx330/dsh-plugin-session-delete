@@ -29,6 +29,39 @@ now atomic: nothing else changes unless the artifact is really gone.
   leaves workspace accounting, the projection cache, and the client's list
   completely untouched, instead of a session that was detached from its
   workspace but still on disk.
+- **Active work blocks deletion.** The plugin asks the shipped read-only
+  `workspace/session-activity` probe — the same one the archive path asks
+  before it refuses — and declines a session whose turn, subagents, background
+  jobs or scheduled reminders are still running, instead of only declining one
+  that is attached. This also replaces an expensive full session-list read
+  with a precise per-session one.
+- **Cleanup after deletion is best-effort.** A cleanup failure is reported in
+  `cleanupWarnings` and never turns a real deletion into an error response,
+  because an error response is exactly what leaves the client holding a
+  phantom row.
+- **A symlink or junction at the artifact path is refused** rather than
+  unlinked, and `lstat` replaces `stat` so a link is never mistaken for a
+  directory this session owns.
+
+### Fixed
+
+- **A cleanup failure left a phantom row.** Once the artifact was gone, a throw
+  from the workspace release returned an error and skipped the removal
+  announcement, so the client kept an unopenable row for a deleted session.
+  The removal is now always announced once the artifact is gone.
+- **`detachedFrom` reported `undefined`.** The workspace entity exposes `id`,
+  not `workspaceId`; the response now carries the real id.
+- **Unknown failure codes leaked a raw locale key** into the dialog. It now
+  falls back to the generic message, decided against the dictionaries rather
+  than against whatever a locale returns for a missing key.
+- **`.` and `..` are rejected as session ids** at the request boundary rather
+  than left for a later guard to notice.
+- **Liveness is re-checked immediately before the irreversible step**, closing
+  the window in which a session became active after the first check.
+- **The test doubles were test-blind.** They now mirror the real workspace
+  entity shape (`id`, not `workspaceId`) and report activity through the
+  shipped probe, so a drift between the plugin and the runtime fails a test
+  instead of passing one.
 
 ## [1.0.0] - 2026-10-02
 

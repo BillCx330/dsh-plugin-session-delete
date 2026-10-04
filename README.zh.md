@@ -39,24 +39,28 @@ Host 侧也没有删除动词：`sessionPersistence` 只有 `create` / `open` / 
 
 ## 删除是如何完成的
 
-Host 半部按以下顺序执行，任何一步失败都会中止并返回可本地化的错误码：
+Host 半部按以下顺序执行：
 
 1. **读取存档头** — `sessionPersistence.stat(sessionId)`；不存在返回 `not-found`。
-2. **拒绝活动会话** — 若 `sessions` / `agents` 中存在该会话，或 `sessionController.list()` 报告 `running`，返回 `live` / `running`。
-   已打开的会话必须拒绝而非硬删：追加写入器仍持有该文件（Windows 上打开中的文件根本无法删除），循环还会继续往已消失的目录提交事件。先归档或切走，再删除。
+2. **拒绝仍在使用中的会话** —— 两道独立护栏，都按"拿不准就拒绝"处理：
+   - *已打开*（存在于 `sessions` / `agents`）→ `live`。已打开的会话必须拒绝而非硬删：追加写入器仍持有该文件（Windows 上打开中的文件根本无法删除），循环还会继续往已消失的目录提交事件。
+   - *仍有活动*（由 DSH 自带的 `workspace/session-activity` 探针报告 —— 进行中的 turn、运行中的子代理、后台任务、定时提醒）→ `running`。这正是归档流程在拒绝之前问的同一个只读探针，因此删除不会把后台任务变成孤儿，也不会留下还在往一个已消失会话投递的定时提醒。
+
+   先归档或切走，再删除。
 3. **删除持久化产物** — 由持久化后端自己给出路径（`locate(header)`），删除该会话目录（含各代 `session.vN.jsonl.zst`）。后端没有 `locate` 时，回退为在配置根目录下两层内查找**目录名恰好等于会话 id** 的目录。
    **产物先删，其余步骤在确认它真的消失之后才动。** 这样后续每一步都只是"已经发生的删除"的收尾，失败也不会留下半删状态。
-4. **释放工作区账户位置** — `workspaceRegistry`：先 `unpinSession`、`unarchiveSession`，再对包含它的 `Workspace` 调用 `detachSession`，把会话从 `workspace.json` 的账目里真正移除。
-5. **清掉投影缓存行** — 通过拥有它的存储域删除，而不是绕过域直接删文件，这样内存表与磁盘文件保持一致：`storageDomain.get('session_projcache').table('sessions').delete(id)`。
-6. **广播移除事件** — `ctx.emit('api-session/removed', sessionId)`。
+4. **然后是尽力而为的收尾** —— 已经发生的删除，绝不因为收尾出错而变成失败响应：请求报错正是"客户端继续抱着一个已删会话的幽灵行"的成因。收尾问题在响应里以 `cleanupWarnings` 报告：
+   - **释放工作区账户位置** — `unpinSession`、`unarchiveSession`，再对包含它的 `Workspace` 调用 `detachSession`，把会话从 `workspace.json` 的账目里真正移除。
+   - **清掉投影缓存行** — 通过拥有它的存储域删除，而不是绕过域直接删文件，这样内存表与磁盘文件保持一致：`storageDomain.get('session_projcache').table('sessions').delete(id)`。
+   - **广播移除事件** — `ctx.emit('api-session/removed', sessionId)`，**无论前两项结果如何都一定会发**。
 
-### 为什么第 6 步是必需的
+### 为什么必须广播移除事件
 
 客户端侧栏的列表只从 `api-session/added` 事件**增长**，其余情况只在重连时整表刷新（`handleConnected` → `refreshList`）。所以主机删掉会话后，客户端会继续显示一行"打不开的会话"。
 
-而"未分组"的推导是 `list.ids.filter(id => !accounted.has(id))` —— 即**列表里有、但没有任何工作区记账**的会话。于是第 4 步的解除挂载恰好把幽灵行从工作区分组推进了"未分组"，点开就报 `session/not-found`。
+而"未分组"的推导是 `list.ids.filter(id => !accounted.has(id))` —— 即**列表里有、但没有任何工作区记账**的会话。于是释放工作区账户位置恰好会把幽灵行从工作区分组推进"未分组"，点开就报 `session/not-found`。
 
-`api-session/removed` 正是 DSH 自己用于此场景的信号：`api-session-controller` 在会话被销毁时发出它，`api-remotes` 转发它（它在该包的转发允许清单内），客户端的 `session-controller` 收到后把该行从列表里移除。因此第 6 步让行**立即**消失，无需刷新页面。
+`api-session/removed` 正是 DSH 自己用于此场景的信号：`api-session-controller` 在会话被销毁时发出它，`api-remotes` 转发它（它在该包的转发允许清单内），客户端的 `session-controller` 收到后把该行从列表里移除。因此广播它让行**立即**消失，无需刷新页面。
 
 > 如果你的侧栏里还残留着 1.0.0 版本删除过的会话（宿主早已无此会话），**刷新一次页面**即可清空：重连触发的全量刷新会丢弃基线中不存在的身份（`mergeOrderedBaseline`：*identities absent from the baseline are removed*）。
 
@@ -66,7 +70,9 @@ Host 半部按以下顺序执行，任何一步失败都会中止并返回可本
 
 - 路径必须是绝对路径；
 - 最后一段必须**恰好**等于所请求的会话 id；
-- 必须严格位于持久化根目录之内。
+- 必须严格位于持久化根目录之内；
+- 必须是真实目录 —— 该路径上是符号链接或 junction 时**拒绝**而不是删链接，因为"一个链接"并不能证明它背后的东西属于这个会话（递归删除同样不会跟着链接进去：这两种情况都是实测确认的，不是假设）；
+- 在不可逆那一步之前**立刻重新检查一次**活动状态，封掉"首次检查之后会话才变成活动"的窗口。
 
 护栏拒绝时返回失败且**不改动任何其他状态**：工作区账目、投影缓存、客户端列表都保持原样。
 
@@ -146,7 +152,9 @@ pnpm test
 
 以下是本插件当前的约束，不是待办清单。
 
-- **已打开（活动）的会话会被拒绝删除**，需先归档或切走。追加写入器仍持有该文件（Windows 上打开中的文件根本无法删除），循环还会继续往已消失的目录提交事件。
+- **仍在使用中的会话会被拒绝删除** —— 已打开的，以及仍有活动的（turn、子代理、后台任务、定时提醒）都算；需先归档或切走。
 - **不递归删除子会话 / 派生会话**：只删除所选会话自己的产物，其 `parentSession` 血缘与子会话保持原样。
+- **产物路径上是符号链接或 junction 时拒绝删除**，既不跟随也不删链接。
+- **删除后的收尾是尽力而为**：失败会在 `cleanupWarnings` 里报告，删除本身依然成立。
 - **附件会保留**：图片 / 文件是内容寻址且可能被其他会话共享，因此不随会话删除。
 - **删除不可撤销**；本插件正是通过确认框来承担这一点。

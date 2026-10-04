@@ -238,4 +238,44 @@ globalThis.fetch = async () => {
 }
 await assert.rejects(() => face.deleteSession('session-abc'), (error) => error.code === 'network')
 
+/* ------------------------- unknown failure codes degrade to a sentence --- */
+
+// A Host that grows new failure codes must never leave a raw `error.<code>`
+// key in the dialog. The test's `t` returns its own key, so a known code
+// renders `error.<code>` while an unmapped one must fall back to the generic
+// message instead of leaking the key.
+const renderForm = () => {
+  const element = overlay.component({
+    useDeletePending: (selector) => selector(face.hooks.deletePending.getSnapshot()),
+    settleSessionDelete: face.settleSessionDelete,
+    deleteSession: face.deleteSession,
+    t: (key) => key,
+  })
+  return element === null ? null : element.type(element.props)
+}
+
+for (const [code, expected] of [
+  ['live', 'error.live'],
+  ['brand-new-failure-code', 'error.failed'],
+]) {
+  face.requestSessionDelete('session-abc', 'A title')
+  resetHooks()
+  let form = renderForm()
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 500,
+    json: async () => ({ ok: false, code }),
+  })
+  await form.props.footer.children[1].props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  // Re-render with the same hook state (only the call cursor resets) so the
+  // error written by the first render is the one this render displays.
+  React.__cursor = 0
+  form = renderForm()
+  const errorNode = form.props.children.find((child) => child !== null && child.props?.key === 'error')
+  assert.ok(errorNode, `an error row must render for code "${code}"`)
+  assert.equal(errorNode.children[0], expected, `failure code "${code}" must render "${expected}"`)
+  face.settleSessionDelete()
+}
+
 console.log('client half: all contract checks passed')

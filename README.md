@@ -39,24 +39,28 @@ The Host exposes no delete verb either: `sessionPersistence` has only `create` /
 
 ## How deletion is carried out
 
-The Host half runs these steps in order; any failure aborts and returns a localizable code:
+The Host half runs these steps in order:
 
 1. **Read the stored header** — `sessionPersistence.stat(sessionId)`; absent → `not-found`.
-2. **Refuse an attached session** — a session present in `sessions` / `agents`, or reported `running` by `sessionController.list()`, returns `live` / `running`.
-   An open session must be refused rather than force-deleted: the append-only writer still holds the artifact (on Windows an open file cannot be removed at all), and the loop would keep committing events into a directory that no longer exists. Archive or navigate away first.
+2. **Refuse a Session that is still in use** — two independent guards, both fail-closed:
+   - *attached* (present in `sessions` / `agents`) → `live`. An open Session must be refused rather than force-deleted: the append-only writer still holds the artifact (on Windows an open file cannot be removed at all) and the loop would keep committing events into a directory that no longer exists.
+   - *active work* (anything reported by the shipped `workspace/session-activity` probe — the turn in progress, running subagents, background jobs, scheduled reminders) → `running`. That is the same read-only probe the archive flow asks before it refuses, so a delete cannot orphan a background job or leave a schedule firing at a Session that is gone.
+
+   Archive it or navigate away first.
 3. **Remove the durable artifact** — the persistence backend names its own path (`locate(header)`); the whole session directory (every `session.vN.jsonl.zst` generation) is removed. Without `locate`, the fallback scans two levels under the configured root for a directory whose name is exactly the session id.
    **The artifact goes first, and nothing else is touched until it is confirmed gone**, so every later step only finishes a deletion that already happened and a failure can never leave a half-removed session.
-4. **Release the workspace account slot** — `workspaceRegistry`: `unpinSession`, `unarchiveSession`, then `detachSession` on every `Workspace` that accounts for it, removing the session from `workspace.json` for real.
-5. **Drop the projection-cache row** — through the domain that owns it, so the in-memory table and the durable file stay coherent, rather than deleting the medium directly: `storageDomain.get('session_projcache').table('sessions').delete(id)`.
-6. **Announce the removal** — `ctx.emit('api-session/removed', sessionId)`.
+4. **Then, best-effort cleanup** — a deletion that has already happened is never turned into an error by cleanup, because failing the request is what leaves the client holding a phantom row for a Session that is gone. Any problem is reported in the response as `cleanupWarnings`:
+   - **Release the workspace account slot** — `unpinSession`, `unarchiveSession`, then `detachSession` on every `Workspace` that accounts for it, removing the session from `workspace.json` for real.
+   - **Drop the projection-cache row** — through the domain that owns it, so the in-memory table and the durable file stay coherent, rather than deleting the medium directly: `storageDomain.get('session_projcache').table('sessions').delete(id)`.
+   - **Announce the removal** — `ctx.emit('api-session/removed', sessionId)`, always, whatever the other two did.
 
-### Why step 6 is required
+### Why the removal must be announced
 
 A client's sidebar list only ever **grows** from the `api-session/added` event; it is otherwise rebuilt in full on reconnect (`handleConnected` → `refreshList`). So a session deleted on the Host keeps a row in the browser — a row that cannot be opened.
 
-Ungrouped is derived as `list.ids.filter(id => !accounted.has(id))` — sessions the list holds that no Workspace accounts for. Step 4's detach therefore moves the phantom row out of its workspace group and **into Ungrouped**, where opening it fails with `session/not-found`.
+Ungrouped is derived as `list.ids.filter(id => !accounted.has(id))` — sessions the list holds that no Workspace accounts for. Releasing the workspace account slot therefore moves the phantom row out of its workspace group and **into Ungrouped**, where opening it fails with `session/not-found`.
 
-`api-session/removed` is the shipped signal for exactly this: `api-session-controller` emits it when a session is disposed, `api-remotes` forwards it (it is on that package's forwarded-event allowlist), and the client's session-controller drops the row on receipt. Step 6 makes the row disappear **immediately**, with no page reload.
+`api-session/removed` is the shipped signal for exactly this: `api-session-controller` emits it when a session is disposed, `api-remotes` forwards it (it is on that package's forwarded-event allowlist), and the client's session-controller drops the row on receipt. Announcing it makes the row disappear **immediately**, with no page reload.
 
 > If your sidebar still holds sessions deleted by version 1.0.0 (which the Host no longer has), **one page reload** clears them: the reconnect refresh discards identities absent from the baseline (`mergeOrderedBaseline`: *identities absent from the baseline are removed*).
 
@@ -66,7 +70,9 @@ Removal is the one irreversible step, so the target is proven before it is touch
 
 - the path must be absolute;
 - its final segment must be exactly the requested session id;
-- it must sit strictly inside the persistence root.
+- it must sit strictly inside the persistence root;
+- it must be a real directory — a symlink or junction at that path is refused rather than unlinked, because a link is not evidence that this Session owns what is behind it (recursion never follows one either: both cases were measured, not assumed);
+- liveness is re-checked immediately before the irreversible step, closing the window in which a Session became active after the first check.
 
 When the guard refuses, the request fails and **nothing else changes**: workspace accounting, projection cache, and the client's list all stay as they were.
 
@@ -146,7 +152,9 @@ None. It appends nothing to any session history — deleting a session removes a
 
 These are current plugin constraints, not a backlog.
 
-- **An open (attached) session is refused**; archive it or navigate away first. The append-only writer still holds the artifact (on Windows an open file cannot be removed at all) and the loop would keep committing events into a directory that no longer exists.
+- **A Session that is still in use is refused** — both an attached one and one with active work (turn, subagents, jobs, schedules). Archive it or navigate away first.
 - **Sub-sessions and forks are not deleted recursively** — only the selected session's own artifact goes, leaving its `parentSession` lineage and its children untouched.
+- **A symlink or junction at the artifact path is refused**, not followed and not unlinked.
+- **Post-deletion cleanup is best-effort**; a failure is reported in `cleanupWarnings` and the deletion still stands.
 - **Attachments survive**, being content-addressed and potentially shared with other sessions.
 - **Deletion cannot be undone**; the confirmation dialog is what carries that responsibility.
