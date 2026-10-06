@@ -222,16 +222,23 @@ async function post(route, body) {
 }
 
 {
+  // Regression: an attached-but-idle Session MUST still be deletable. The
+  // client retains every visible row (`useSessionStatus`), so "attached" is
+  // the ordinary state of every row in the sidebar — treating it as a refusal
+  // made the plugin refuse every session, which is the bug this test exists
+  // to keep fixed. Only reported activity may block a delete.
   const dir = await seedSession('--proj--', 'session-live')
   const { ctx, state } = makeContext({ live: true })
   host.apply(ctx)
 
   const { status, payload } = await post(state.route, { sessionId: 'session-live' })
-  assert.equal(status, 409)
-  assert.equal(payload.code, 'live')
-  await stat(dir)
-  assert.deepEqual(state.detached, [])
-  await rm(dir, { recursive: true, force: true })
+  assert.equal(status, 200, 'an attached but idle Session must be deletable')
+  assert.equal(payload.ok, true)
+  assert.equal(payload.artifactRemoved, true)
+  assert.equal(payload.announced, true)
+  assert.equal(state.activityQueries > 0, true, 'running work must still be asked about')
+  await assert.rejects(() => stat(dir), 'the artifact must be gone')
+  assert.deepEqual(state.detached, ['session-live'], 'the workspace slot must be released')
 }
 
 {

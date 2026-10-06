@@ -42,11 +42,11 @@ The Host exposes no delete verb either: `sessionPersistence` has only `create` /
 The Host half runs these steps in order:
 
 1. **Read the stored header** — `sessionPersistence.stat(sessionId)`; absent → `not-found`.
-2. **Refuse a Session that is still in use** — two independent guards, both fail-closed:
-   - *attached* (present in `sessions` / `agents`) → `live`. An open Session must be refused rather than force-deleted: the append-only writer still holds the artifact (on Windows an open file cannot be removed at all) and the loop would keep committing events into a directory that no longer exists.
-   - *active work* (anything reported by the shipped `workspace/session-activity` probe — the turn in progress, running subagents, background jobs, scheduled reminders) → `running`. That is the same read-only probe the archive flow asks before it refuses, so a delete cannot orphan a background job or leave a schedule firing at a Session that is gone.
+2. **Refuse a Session that still has running work** — anything reported by the shipped `workspace/session-activity` probe (the turn in progress, running subagents, background jobs, scheduled reminders) → `running`. That is the same read-only probe the archive flow asks before it refuses, so deleting a Session cannot orphan a job or leave a schedule firing at a Session that is gone.
 
-   Archive it or navigate away first.
+   Being merely *open* is deliberately not a refusal. The client keeps every visible Session row attached (so the status dot has a source at all), so an attached-but-idle Session is the ordinary case in the sidebar — refusing it would refuse every row. And on Windows an open file cannot be removed at all, so a writer that really is holding the artifact makes the removal fail honestly rather than corrupting anything.
+
+   If the probe reports work, stop it first.
 3. **Remove the durable artifact** — the persistence backend names its own path (`locate(header)`); the whole session directory (every `session.vN.jsonl.zst` generation) is removed. Without `locate`, the fallback scans two levels under the configured root for a directory whose name is exactly the session id.
    **The artifact goes first, and nothing else is touched until it is confirmed gone**, so every later step only finishes a deletion that already happened and a failure can never leave a half-removed session.
 4. **Then, best-effort cleanup** — a deletion that has already happened is never turned into an error by cleanup, because failing the request is what leaves the client holding a phantom row for a Session that is gone. Any problem is reported in the response as `cleanupWarnings`:
@@ -152,7 +152,7 @@ None. It appends nothing to any session history — deleting a session removes a
 
 These are current plugin constraints, not a backlog.
 
-- **A Session that is still in use is refused** — both an attached one and one with active work (turn, subagents, jobs, schedules). Archive it or navigate away first.
+- **A Session with running work is refused** (turn, subagents, jobs, schedules); stop it first. Being merely open is not a refusal — the sidebar keeps every row attached.
 - **Sub-sessions and forks are not deleted recursively** — only the selected session's own artifact goes, leaving its `parentSession` lineage and its children untouched.
 - **A symlink or junction at the artifact path is refused**, not followed and not unlinked.
 - **Post-deletion cleanup is best-effort**; a failure is reported in `cleanupWarnings` and the deletion still stands.

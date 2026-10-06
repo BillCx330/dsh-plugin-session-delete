@@ -32,9 +32,17 @@ now atomic: nothing else changes unless the artifact is really gone.
 - **Active work blocks deletion.** The plugin asks the shipped read-only
   `workspace/session-activity` probe — the same one the archive path asks
   before it refuses — and declines a session whose turn, subagents, background
-  jobs or scheduled reminders are still running, instead of only declining one
-  that is attached. This also replaces an expensive full session-list read
-  with a precise per-session one.
+  jobs or scheduled reminders are still running. This also replaces an
+  expensive full session-list read with a precise per-session one.
+- **Being attached is no longer a refusal.** The client keeps every visible
+  Session row attached (`useSessionStatus` retains it so the status dot has a
+  source at all), so "attached but idle" is the ordinary state of every row in
+  the sidebar. Refusing on that basis refused *every* session — reported as
+  "this Session is open in this process" no matter which row you chose. The
+  only remaining refusal is reported activity, which is what actually has to
+  stop before a deletion. On Windows an open file cannot be removed at all, so
+  a writer genuinely holding the artifact still fails the removal honestly
+  instead of corrupting anything.
 - **Cleanup after deletion is best-effort.** A cleanup failure is reported in
   `cleanupWarnings` and never turns a real deletion into an error response,
   because an error response is exactly what leaves the client holding a

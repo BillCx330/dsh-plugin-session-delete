@@ -228,10 +228,10 @@ assert.equal(face.hooks.deletePending.getSnapshot(), null)
 globalThis.fetch = async () => ({
   ok: false,
   status: 409,
-  json: async () => ({ ok: false, code: 'live', message: 'open' }),
+  json: async () => ({ ok: false, code: 'running', message: 'busy' }),
 })
 
-await assert.rejects(() => face.deleteSession('session-abc'), (error) => error.code === 'live')
+await assert.rejects(() => face.deleteSession('session-abc'), (error) => error.code === 'running')
 
 globalThis.fetch = async () => {
   throw new Error('offline')
@@ -255,7 +255,7 @@ const renderForm = () => {
 }
 
 for (const [code, expected] of [
-  ['live', 'error.live'],
+  ['running', 'error.running'],
   ['brand-new-failure-code', 'error.failed'],
 ]) {
   face.requestSessionDelete('session-abc', 'A title')
