@@ -51,8 +51,21 @@ The Host half runs these steps in order:
    **The artifact goes first, and nothing else is touched until it is confirmed gone**, so every later step only finishes a deletion that already happened and a failure can never leave a half-removed session.
 4. **Then, best-effort cleanup** — a deletion that has already happened is never turned into an error by cleanup, because failing the request is what leaves the client holding a phantom row for a Session that is gone. Any problem is reported in the response as `cleanupWarnings`:
    - **Release the workspace account slot** — `unpinSession`, `unarchiveSession`, then `detachSession` on every `Workspace` that accounts for it, removing the session from `workspace.json` for real.
+   - **Remove the subagent descendants** — see *Subagents go with their parent* below.
    - **Drop the projection-cache row** — through the domain that owns it, so the in-memory table and the durable file stay coherent, rather than deleting the medium directly: `storageDomain.get('session_projcache').table('sessions').delete(id)`.
-   - **Announce the removal** — `ctx.emit('api-session/removed', sessionId)`, always, whatever the other two did.
+   - **Announce the removal** — `ctx.emit('api-session/removed', sessionId)`, always, whatever the others did.
+
+### Subagents go with their parent
+
+Subagent Sessions are the one kind of child that is *not* safe to leave behind. A fork is a `structuredClone`d copy that becomes an ordinary independent Session; a subagent Session instead keeps a `parentSession` that is used as an **authorization witness** — access needs a two-part address, and a parent that no longer exists makes the child permanently unreachable (`subagent/unauthorized`). Hidden from the sidebar by `origin: 'subagent'`, such an orphan is invisible, unopenable, and unremovable through any surface.
+
+They are also stored as **siblings**, not nested (`sessionDir` is `<root>/<project>/<id>/` and looks at neither `origin` nor `parentSession`), so deleting a parent directory never reaches them.
+
+So deletion collects them through `sessionQuery.traceSession(id)` and removes the whole tree. DSH's own export treats the same tree as one Session (`includeDescendants`, packed as `subagents/<id>/…`), which makes this the shipped meaning of "delete this session".
+
+**Fork branches are deliberately left alone** — they are independent copies and survive the parent intact, promoted to top-level rows in the sidebar. The confirmation dialog states both facts before anything is destroyed: how many subagents go with the Session, and that branched conversations stay.
+
+Each subagent removal is best-effort and individually reported; one that fails stops neither the parent deletion nor the remaining children.
 
 ### Why the removal must be announced
 
@@ -153,7 +166,7 @@ None. It appends nothing to any session history — deleting a session removes a
 These are current plugin constraints, not a backlog.
 
 - **A Session with running work is refused** (turn, subagents, jobs, schedules); stop it first. Being merely open is not a refusal — the sidebar keeps every row attached.
-- **Sub-sessions and forks are not deleted recursively** — only the selected session's own artifact goes, leaving its `parentSession` lineage and its children untouched.
+- **Subagent descendants are deleted with their parent**; fork branches are not — they are independent copies and stay. Both are stated in the confirmation dialog.
 - **A symlink or junction at the artifact path is refused**, not followed and not unlinked.
 - **Post-deletion cleanup is best-effort**; a failure is reported in `cleanupWarnings` and the deletion still stands.
 - **Attachments survive**, being content-addressed and potentially shared with other sessions.

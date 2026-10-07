@@ -21,6 +21,22 @@ now atomic: nothing else changes unless the artifact is really gone.
 - **Projection-cache cleanup.** The deleted session's `session_projcache` row
   is removed through the storage domain that owns it, so the in-memory table
   and the durable file stay coherent.
+- **Subagent descendants are deleted with their parent.** Subagent Sessions are
+  the one child kind that is not safe to leave behind: unlike a fork (a
+  `structuredClone`d copy that becomes an independent Session), a subagent
+  Session keeps a `parentSession` used as an authorization witness, so a parent
+  that is gone makes the child permanently unreachable (`subagent/unauthorized`)
+  — and being hidden by `origin: 'subagent'`, such an orphan is invisible,
+  unopenable and unremovable through any surface. They are also stored as
+  siblings (`sessionDir` looks at neither `origin` nor `parentSession`), so
+  deleting a parent directory never reaches them. Deletion now collects the
+  whole tree through `sessionQuery.traceSession(id)` and removes it — the same
+  tree DSH's own export treats as one Session (`includeDescendants`). Each
+  child removal is best-effort and individually reported.
+- **A read-only preview route** (`/api/session.delete.preview`) describes the
+  blast radius before anything is destroyed. The confirmation dialog shows the
+  subagent count alongside a note that branched conversations survive as
+  independent sessions.
 
 ### Changed
 

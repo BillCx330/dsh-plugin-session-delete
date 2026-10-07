@@ -26,6 +26,11 @@ function createElement(type, props, ...children) {
 const React = {
   createElement,
   Fragment: Symbol('Fragment'),
+  // Effect stub: runs the setup immediately and ignores the teardown. Enough to
+  // exercise components that fetch on mount.
+  useEffect(effect) {
+    effect()
+  },
   useState(initial) {
     const slot = React.__cursor ?? 0
     React.__cursor = slot + 1
@@ -163,11 +168,21 @@ assert.deepEqual(
 
 /* --------------------------------------------------------- the dialog --- */
 
+// A preview reporting two subagent sessions, so the dialog's blast-radius note
+// has something real to render.
+const previewIds = ['sub-1', 'sub-2']
+const previewCalls = []
+const facePreview = async (sessionId) => {
+  previewCalls.push(sessionId)
+  return previewIds
+}
+
 resetHooks()
 const dialogElement = overlay.component({
   useDeletePending: (selector) => selector(face.hooks.deletePending.getSnapshot()),
   settleSessionDelete: face.settleSessionDelete,
   deleteSession: face.deleteSession,
+  preview: facePreview,
   t: (key) => key,
 })
 
@@ -178,9 +193,33 @@ assert.equal(dialogElement.props.request.sessionId, 'session-abc')
 resetHooks()
 const modalElement = dialogElement.type(dialogElement.props)
 
+// The preview resolves after mount, so the note appears on the render that
+// follows it. Real React re-renders on the state change; here we re-render
+// with the same hook state and assert against that.
+await new Promise((resolve) => setTimeout(resolve, 0))
+React.__cursor = 0
+const modalWithPreview = dialogElement.type(dialogElement.props)
+
 assert.equal(modalElement.type, 'Modal')
 assert.equal(modalElement.props.open, true)
 assert.equal(modalElement.props.title, 'dialog.title')
+
+// The blast radius is described before anything is destroyed: subagent count
+// (hidden from the sidebar by `origin: 'subagent'`) and a note that fork
+// branches survive as independent sessions.
+// The preview is asked for the request's session. The effect keys on
+// `request.sessionId`, so re-rendering the same request does not re-query it
+// in real React; the test's `useEffect` stub re-runs on every render, hence
+// the "at least once" rather than "exactly once" assertion.
+assert.ok(previewCalls.length >= 1, 'the preview must be asked for the request')
+assert.ok(previewCalls.every((id) => id === 'session-abc'), 'the preview must only ever be asked about the request session')
+const noteKeys = modalWithPreview.props.children
+  .filter((child) => child !== null && child !== undefined)
+  .map((child) => child.props.key)
+assert.ok(noteKeys.includes('subagents'), 'the subagent blast-radius note must render when there are subagents')
+assert.ok(noteKeys.includes('forks'), 'the fork-survival note must always render')
+const subagentNote = modalWithPreview.props.children.find((child) => child !== null && child.props?.key === 'subagents')
+assert.equal(subagentNote.props.role, 'note')
 
 const footer = modalElement.props.footer
 assert.equal(footer.type, React.Fragment)
@@ -249,6 +288,7 @@ const renderForm = () => {
     useDeletePending: (selector) => selector(face.hooks.deletePending.getSnapshot()),
     settleSessionDelete: face.settleSessionDelete,
     deleteSession: face.deleteSession,
+    preview: facePreview,
     t: (key) => key,
   })
   return element === null ? null : element.type(element.props)

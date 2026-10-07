@@ -24,7 +24,7 @@ async function seedSession(project, sessionId) {
 }
 
 /** Build a Host context over one fake deployment shape. */
-function makeContext({ live = false, running = false, locate = true, outsidePath, failDetach = false, failUnpin = false } = {}) {
+function makeContext({ live = false, running = false, locate = true, outsidePath, failDetach = false, failUnpin = false, descendants = [] } = {}) {
   const state = {
     detached: [],
     unpinned: [],
@@ -33,6 +33,7 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
     cacheDropped: [],
     activityQueries: 0,
     route: undefined,
+    previewRoute: undefined,
   }
 
   const sessions = {
@@ -90,7 +91,8 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
     connection: {
       fetch: {
         register(route) {
-          state.route = route
+          if (route.path.endsWith('.preview')) state.previewRoute = route
+          else state.route = route
         },
       },
     },
@@ -110,6 +112,14 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
           return agents
         case 'sessionPersistence':
           return persistence
+        case 'sessionQuery':
+          return {
+            // Lineage shape mirrors the real service: nested `descendants`,
+            // each node a `SessionRecord` with a `header` carrying `origin`.
+            async traceSession() {
+              return { target: { header: { id: 'session-x' } }, ancestors: [], descendants }
+            },
+          }
         case 'workspaceRegistry':
           return workspaceRegistry
         case 'storageDomain':
@@ -276,6 +286,92 @@ async function post(route, body) {
   assert.deepEqual(state.cacheDropped, [], 'a refused removal must not drop the cache row')
 
   await rm(outside, { recursive: true, force: true })
+}
+
+/* ----------------------------- subagent descendants go with their parent --- */
+
+{
+  // Subagent sessions are siblings on disk and authorized through their parent,
+  // so a parent that is deleted strands them permanently. They must be removed
+  // with it. A fork branch sitting in the same tree is a different thing: an
+  // independent copy, and it must NOT be touched.
+  const tree = [
+    {
+      session: { header: { id: 'sub-a', origin: 'subagent', parentSession: 'session-x' } },
+      descendants: [
+        {
+          session: { header: { id: 'sub-a1', origin: 'subagent', parentSession: 'sub-a' } },
+          descendants: [],
+        },
+        {
+          // A fork branch nested under a subagent: no `origin`, so untouched.
+          session: { header: { id: 'fork-b', parentSession: 'sub-a' } },
+          descendants: [],
+        },
+      ],
+    },
+    { session: { header: { id: 'fork-top', parentSession: 'session-x' } }, descendants: [] },
+  ]
+  for (const id of ['session-x', 'sub-a', 'sub-a1']) await seedSession('--proj--', id)
+  const { ctx, state } = makeContext({ descendants: tree })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200)
+  assert.deepEqual(payload.subagentsRemoved, ['sub-a', 'sub-a1'], 'every subagent descendant must go with its parent, depth-first')
+  for (const id of ['session-x', 'sub-a', 'sub-a1']) {
+    await assert.rejects(() => stat(join(root, '--proj--', id)), `${id} must be gone`)
+  }
+  assert.ok(!payload.subagentsRemoved.includes('fork-top'), 'a fork branch is not a subagent and must never be removed with its parent')
+  assert.deepEqual(state.emitted, [
+    ['api-session/removed', 'sub-a'],
+    ['api-session/removed', 'sub-a1'],
+    ['api-session/removed', 'session-x'],
+  ], 'each removed subagent is announced too, then the parent')
+  assert.deepEqual(state.cacheDropped.sort(), ['session-x', 'sub-a', 'sub-a1'].sort(), 'each subagent cache row is dropped')
+}
+
+{
+  // A failing subagent removal is reported but never blocks the parent or the
+  // remaining subagents.
+  await seedSession('--proj--', 'session-x')
+  await seedSession('--proj--', 'sub-ok')
+  const tree = [
+    { session: { header: { id: 'sub-missing', origin: 'subagent' } }, descendants: [] },
+    { session: { header: { id: 'sub-ok', origin: 'subagent' } }, descendants: [] },
+  ]
+  const { ctx, state } = makeContext({ descendants: tree })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200, 'a subagent that cannot be removed must not fail the parent deletion')
+  assert.equal(payload.ok, true)
+  assert.deepEqual(payload.subagentsRemoved, ['sub-ok'])
+  assert.equal(payload.subagentWarnings.length, 1)
+  assert.match(payload.subagentWarnings[0], /sub-missing/u)
+  assert.equal(payload.announced, true)
+  await assert.rejects(() => stat(join(root, '--proj--', 'sub-ok')))
+}
+
+{
+  // The preview route is read-only and reports the blast radius.
+  await seedSession('--proj--', 'session-x')
+  const tree = [
+    { session: { header: { id: 'sub-a', origin: 'subagent' } }, descendants: [] },
+    { session: { header: { id: 'fork-top', parentSession: 'session-x' } }, descendants: [] },
+  ]
+  const { ctx, state } = makeContext({ descendants: tree })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.previewRoute, { sessionId: 'session-x' })
+  assert.equal(status, 200)
+  assert.deepEqual(payload.subagentIds, ['sub-a'], 'the preview counts subagents only, not fork branches')
+  assert.equal(
+    await stat(join(root, '--proj--', 'session-x')).then(() => true, () => false),
+    true,
+    'the preview must not delete anything',
+  )
+  assert.deepEqual(state.emitted, [], 'the preview must not announce a removal')
 }
 
 /* --------------------------- partial cleanup is never an error, never silent */
