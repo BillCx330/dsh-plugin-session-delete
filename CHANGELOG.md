@@ -69,6 +69,18 @@ now atomic: nothing else changes unless the artifact is really gone.
 
 ### Fixed
 
+- **A row whose Session was already gone could never be removed.** Deleting it
+  reported `not-found` forever, so the one action offered to clear it could
+  never succeed — a dead end in *Ungrouped*. Such rows are real: the workspace
+  registry indexes persisted headers at startup and live ones only through
+  `attachSession`, so a Session that is live but unpersisted is listed yet
+  accounted by no Workspace, and `persistence.stat` has nothing to find for it.
+  Deletion is now idempotent — with nothing stored it still succeeds and runs
+  the same cleanup (release the account slot, drop the cache row, announce the
+  removal), which is what dismisses the row. The response reports
+  `alreadyGone: true` and `liveInMemory`, distinguishing a merely stale row from
+  one still held by the live store (which can return after a reconnect; a DSH
+  restart clears it).
 - **A cleanup failure left a phantom row.** Once the artifact was gone, a throw
   from the workspace release returned an error and skipped the removal
   announcement, so the client kept an unopenable row for a deleted session.

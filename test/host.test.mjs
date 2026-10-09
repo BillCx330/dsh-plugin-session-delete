@@ -37,7 +37,9 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
   }
 
   const sessions = {
-    get: (id) => (live && id === 'session-live' ? { id } : undefined),
+    // `session-zombie` is held live but has no stored artifact: the case where
+    // a sidebar row outlives its storage and returns after a reconnect.
+    get: (id) => (live && (id === 'session-live' || id === 'session-zombie') ? { id } : undefined),
   }
 
   const agents = { get: () => undefined }
@@ -50,7 +52,7 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
   const persistence = {
     root,
     async stat(id) {
-      if (id === 'session-missing') return undefined
+      if (id === 'session-missing' || id === 'session-zombie') return undefined
       return { header: { id, cwd: 'C:\\proj', version: 4, createdAt: 0, isSeeded: false } }
     },
     ...(locate
@@ -212,10 +214,6 @@ async function post(route, body) {
   const { ctx, state } = makeContext()
   host.apply(ctx)
 
-  const missing = await post(state.route, { sessionId: 'session-missing' })
-  assert.equal(missing.status, 404)
-  assert.equal(missing.payload.code, 'not-found')
-
   const malformed = await post(state.route, 'not json')
   assert.equal(malformed.status, 400)
   assert.equal(malformed.payload.code, 'bad-request')
@@ -372,6 +370,54 @@ async function post(route, body) {
     'the preview must not delete anything',
   )
   assert.deepEqual(state.emitted, [], 'the preview must not announce a removal')
+}
+
+/* ------------------- a row whose artifact is gone must still be dismissable */
+
+{
+  // Regression: a sidebar row whose Session is no longer in storage used to
+  // return `not-found` forever, so the row could never be removed through the
+  // UI — the exact dead end a user hit. It is now idempotent: the request
+  // succeeds and finishes the bookkeeping, which is what drops the row.
+  const { ctx, state } = makeContext()
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-missing' })
+  assert.equal(status, 200, 'an already-gone Session is a success, not a dead end')
+  assert.equal(payload.ok, true)
+  assert.equal(payload.alreadyGone, true)
+  assert.equal(payload.artifactRemoved, false, 'nothing was left to remove')
+  assert.equal(payload.announced, true, 'the removal must still be announced so the row disappears')
+  assert.equal(payload.liveInMemory, false, 'an unknown id is not held by the live store')
+  assert.deepEqual(state.emitted, [['api-session/removed', 'session-missing']])
+  assert.deepEqual(state.cacheDropped, ['session-missing'], 'a stale cache row is still dropped')
+}
+
+{
+  // A row whose artifact is gone but whose Session is still held live is the
+  // harder case: `listSessions` unions live sessions with persisted ones, so
+  // the row can return after a reconnect. The response must say which case it
+  // was so a report is answerable instead of a guess.
+  const { ctx, state } = makeContext({ live: true })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-zombie' })
+  assert.equal(status, 200)
+  assert.equal(payload.alreadyGone, true)
+  assert.equal(payload.liveInMemory, true, 'a live-but-unpersisted Session must be flagged')
+  assert.equal(payload.announced, true)
+}
+
+{
+  // The preview describes an already-gone Session as empty instead of failing,
+  // so the confirmation dialog opens consistently.
+  const { ctx, state } = makeContext()
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.previewRoute, { sessionId: 'session-missing' })
+  assert.equal(status, 200)
+  assert.deepEqual(payload.subagentIds, [])
+  assert.equal(payload.alreadyGone, true)
 }
 
 /* --------------------------- partial cleanup is never an error, never silent */

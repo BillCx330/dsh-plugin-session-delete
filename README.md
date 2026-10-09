@@ -41,7 +41,7 @@ The Host exposes no delete verb either: `sessionPersistence` has only `create` /
 
 The Host half runs these steps in order:
 
-1. **Read the stored header** — `sessionPersistence.stat(sessionId)`; absent → `not-found`.
+1. **Read the stored header** — `sessionPersistence.stat(sessionId)`. With nothing stored the Session is *already gone*: the request still succeeds and finishes the bookkeeping (see *An already-gone Session is still removable*).
 2. **Refuse a Session that still has running work** — anything reported by the shipped `workspace/session-activity` probe (the turn in progress, running subagents, background jobs, scheduled reminders) → `running`. That is the same read-only probe the archive flow asks before it refuses, so deleting a Session cannot orphan a job or leave a schedule firing at a Session that is gone.
 
    Being merely *open* is deliberately not a refusal. The client keeps every visible Session row attached (so the status dot has a source at all), so an attached-but-idle Session is the ordinary case in the sidebar — refusing it would refuse every row. And on Windows an open file cannot be removed at all, so a writer that really is holding the artifact makes the removal fail honestly rather than corrupting anything.
@@ -66,6 +66,28 @@ So deletion collects them through `sessionQuery.traceSession(id)` and removes th
 **Fork branches are deliberately left alone** — they are independent copies and survive the parent intact, promoted to top-level rows in the sidebar. The confirmation dialog states both facts before anything is destroyed: how many subagents go with the Session, and that branched conversations stay.
 
 Each subagent removal is best-effort and individually reported; one that fails stops neither the parent deletion nor the remaining children.
+
+### An already-gone Session is still removable
+
+A sidebar row can outlive its Session's storage. The workspace registry indexes
+persisted headers at startup and live ones only through `attachSession`, so a
+Session that is live but unpersisted is listed yet accounted by no Workspace —
+it lands in **Ungrouped**, and `persistence.stat` has nothing to find for it.
+
+Before this was fixed, deleting such a row reported `not-found` forever: the one
+action offered to remove it could never succeed, so the row was a dead end.
+
+Deletion is now **idempotent**. When there is nothing stored, the request
+returns success and runs the same cleanup — release the workspace account slot,
+drop the projection-cache row, announce the removal — which is exactly what
+dismisses the row. The response reports `alreadyGone: true`, plus
+`liveInMemory` to say whether the Session is still held by the live store.
+
+`liveInMemory: true` is worth paying attention to: `listSessions` unions live
+sessions with persisted ones, so a Session still held in memory can reappear
+after a reconnect even though its row was dropped. Restarting DSH clears such a
+holder. `liveInMemory: false` means the row was simply stale and is gone for
+good.
 
 ### Why the removal must be announced
 
