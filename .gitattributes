@@ -1,0 +1,4 @@
+# Normalise every text file to LF in the repository and in checkouts. This
+# project is developed on Windows with `core.autocrlf=true`, so without this a
+# fresh checkout comes back CRLF and every diff looks like a whole-file rewrite.
+* text=auto eol=lf

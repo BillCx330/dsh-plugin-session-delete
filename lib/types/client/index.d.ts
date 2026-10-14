@@ -24,19 +24,33 @@ export declare const inject: readonly ['slots', 'locale']
  */
 export declare function apply(ctx: Context): void
 
+/**
+ * Every key this package's dictionaries carry, in dictionary order.
+ *
+ * Kept in lockstep with the runtime `zh`/`en` objects and checked by
+ * `test/vocabulary.test.mjs`. `error.*` keys other than `error.network` name
+ * the Host's `SESSION_DELETE_CODES`; `error.network` is Client-synthesized.
+ */
 declare module '@deepseek-ai/dsh-client-ui-slots' {
   interface LocaleNamespaceMap {
     'session-delete':
       | 'menu.deleteSession'
       | 'dialog.title'
       | 'dialog.desc'
+      | 'dialog.subagents'
+      | 'dialog.forks'
+      | 'dialog.previewUnavailable'
+      | 'dialog.deleted'
+      | 'dialog.warnTitle'
+      | 'dialog.warn.subagents'
+      | 'dialog.warn.cleanup'
+      | 'dialog.warn.live'
       | 'dialog.pending'
       | 'dialog.confirm'
       | 'dialog.cancel'
       | 'dialog.close'
       | 'dialog.untitled'
       | 'error.bad-request'
-      | 'error.not-found'
       | 'error.live'
       | 'error.running'
       | 'error.unavailable'

@@ -17,6 +17,33 @@ const CLIENT = resolve(import.meta.dirname, '..', 'lib', 'client.js')
 const rendered = []
 const elements = []
 
+/* A minimal document, so the stylesheet lifecycle (install once, release on
+   teardown) is observable instead of silently skipped. */
+const styleTags = []
+globalThis.document = {
+  head: {
+    appendChild(tag) {
+      styleTags.push(tag)
+    },
+  },
+  createElement(tagName) {
+    return {
+      tagName,
+      dataset: {},
+      textContent: '',
+      removed: false,
+      remove() {
+        this.removed = true
+      },
+    }
+  },
+  querySelector(selector) {
+    const match = /^style\[data-plugin-css="(.*)"\]$/u.exec(selector)
+    if (match === null) return null
+    return styleTags.find((tag) => tag.dataset.pluginCss === match[1] && !tag.removed) ?? null
+  },
+}
+
 function createElement(type, props, ...children) {
   const element = { type, props: props ?? {}, children: children.filter((c) => c !== null && c !== undefined) }
   elements.push(element)
@@ -61,9 +88,9 @@ const effects = []
 
 const ctx = {
   effect(callback, label) {
-    effects.push(label)
     const dispose = callback()
-    return typeof dispose === 'function' ? dispose : () => {}
+    effects.push({ label, dispose: typeof dispose === 'function' ? dispose : () => {} })
+    return dispose
   },
   locale: {
     register(ns, dicts) {
@@ -111,7 +138,21 @@ assert.deepEqual(plugin.inject, ['slots', 'locale'], 'client half must inject th
 
 plugin.apply(ctx)
 
-assert.equal(effects.length, 1, 'apply must own exactly one locale effect')
+assert.deepEqual(
+  effects.map((entry) => entry.label),
+  ['session-delete: styles', 'session-delete: dictionaries'],
+  'apply must own the stylesheet effect and the locale effect',
+)
+
+/* ------------------------------------------------------- stylesheet --- */
+
+assert.equal(styleTags.length, 1, 'apply must install its stylesheet once')
+assert.equal(styleTags[0].dataset.plugin, 'dsh-plugin-session-delete')
+// The module system strips a plugin's owned styles on the code-replacement
+// path only; disabling a plugin leaves them in the document unless the plugin
+// releases them itself.
+effects[0].dispose()
+assert.equal(styleTags[0].removed, true, 'the stylesheet effect must release the tag on teardown')
 
 assert.deepEqual(
   localeDictionaries.map((entry) => entry.ns),
@@ -264,6 +305,48 @@ assert.equal(face.hooks.deletePending.getSnapshot(), null)
 
 /* ------------------------------------------------ Host failure mapping --- */
 
+// The REAL preview hop must be exercised, not only stubbed: it reads the
+// non-destructive route, and returning `[]` when the Host could not be asked
+// would tell the user there is no blast radius at the one moment they decide to
+// act. A copy/paste of the delete route in here would delete a Session the
+// instant the dialog opened, so the URL is asserted too.
+{
+  const previewCalls = []
+  globalThis.fetch = async (url, init) => {
+    previewCalls.push({ url, init })
+    return { ok: true, json: async () => ({ ok: true, subagentIds: ['a', 'b'] }) }
+  }
+
+  assert.deepEqual(await face.preview('session-abc'), ['a', 'b'], 'the real preview hop must return the ids')
+  assert.equal(previewCalls.length, 1)
+  assert.equal(previewCalls[0].url, '/api/session.delete.preview', 'the preview must never call the destructive route')
+  assert.equal(previewCalls[0].init.method, 'POST')
+  assert.deepEqual(JSON.parse(previewCalls[0].init.body), { sessionId: 'session-abc' })
+
+  globalThis.fetch = async () => ({
+    ok: false,
+    status: 500,
+    json: async () => ({ ok: false, code: 'failed' }),
+  })
+  assert.equal(await face.preview('session-abc'), null, 'a Host failure must read as "unknown", not "none"')
+
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true }) })
+  assert.equal(await face.preview('session-abc'), null, 'a payload without subagentIds must read as "unknown"')
+
+  globalThis.fetch = async () => ({
+    ok: true,
+    json: async () => {
+      throw new Error('not json')
+    },
+  })
+  assert.equal(await face.preview('session-abc'), null, 'an unreadable body must read as "unknown"')
+
+  globalThis.fetch = async () => {
+    throw new Error('offline')
+  }
+  assert.equal(await face.preview('session-abc'), null, 'an unreachable Host must read as "unknown"')
+}
+
 globalThis.fetch = async () => ({
   ok: false,
   status: 409,
@@ -295,6 +378,7 @@ const renderForm = () => {
 }
 
 for (const [code, expected] of [
+  ['live', 'error.live'],
   ['running', 'error.running'],
   ['brand-new-failure-code', 'error.failed'],
 ]) {
@@ -315,6 +399,105 @@ for (const [code, expected] of [
   const errorNode = form.props.children.find((child) => child !== null && child.props?.key === 'error')
   assert.ok(errorNode, `an error row must render for code "${code}"`)
   assert.equal(errorNode.children[0], expected, `failure code "${code}" must render "${expected}"`)
+  face.settleSessionDelete()
+}
+
+/* ------------------- a partial result is reported, not silently dropped --- */
+
+// The deletion really happened, but the Host reported things the user has to
+// know: a subagent that could not be removed, and a live Session whose row can
+// come back. Closing the dialog on top of those is what made the cascade bug
+// invisible; the form must stay open on the report until the user closes it.
+{
+  const localized = []
+  const t = (key, params) => {
+    localized.push([key, params])
+    return key
+  }
+  const render = (deleteSession, preview) => {
+    const element = overlay.component({
+      useDeletePending: (selector) => selector(face.hooks.deletePending.getSnapshot()),
+      settleSessionDelete: () => {
+        settledCount += 1
+        face.settleSessionDelete()
+      },
+      deleteSession,
+      preview,
+      t,
+    })
+    return element === null ? null : element.type(element.props)
+  }
+
+  let settledCount = 0
+  const deleteSession = async () => ({
+    ok: true,
+    sessionId: 'session-warn',
+    artifactRemoved: true,
+    subagentWarnings: ['sub-x: artifact not removed (live)'],
+    liveInMemory: true,
+  })
+
+  face.requestSessionDelete('session-warn', 'A title')
+  resetHooks()
+  let form = render(deleteSession, async () => [])
+  await form.props.footer.children[1].props.onClick()
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  React.__cursor = 0
+  form = render(deleteSession, async () => [])
+
+  assert.equal(settledCount, 0, 'a reported partial result must keep the dialog open')
+  assert.equal(form.props.description, 'dialog.deleted', 'the dialog must say the Session is gone')
+  assert.equal(form.props.footer.type, 'Button', 'the only action left is Close')
+  assert.equal(form.props.footer.props.children, 'dialog.close')
+
+  const warnNode = form.props.children.find((child) => child !== null && child.props?.key === 'warn')
+  assert.ok(warnNode, 'the dialog must render the warning block')
+  assert.equal(warnNode.props.role, 'alert')
+  assert.deepEqual(
+    warnNode.children.map((child) => child.children[0]),
+    ['dialog.warnTitle', 'dialog.warn.subagents', 'dialog.warn.live'],
+    'every reported problem must get its own localized line',
+  )
+  assert.deepEqual(
+    localized.filter(([key]) => key === 'dialog.warn.subagents'),
+    [['dialog.warn.subagents', { detail: 'sub-x: artifact not removed (live)' }]],
+    'the child id must reach the localized sentence',
+  )
+
+  form.props.footer.props.onClick()
+  assert.equal(settledCount, 1, 'closing must settle the request')
+  assert.equal(face.hooks.deletePending.getSnapshot(), null)
+}
+
+/* ------------------- an unaskable preview is not "no subagents" --- */
+
+{
+  face.requestSessionDelete('session-nopreview', 'A title')
+  resetHooks()
+  const render = (preview) => {
+    const element = overlay.component({
+      useDeletePending: (selector) => selector(face.hooks.deletePending.getSnapshot()),
+      settleSessionDelete: face.settleSessionDelete,
+      deleteSession: async () => ({ ok: true }),
+      preview,
+      t: (key) => key,
+    })
+    return element === null ? null : element.type(element.props)
+  }
+
+  let form = render(async () => null)
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  React.__cursor = 0
+  form = render(async () => null)
+
+  const previewNode = form.props.children.find((child) => child !== null && child.props?.key === 'preview')
+  assert.ok(previewNode, 'a failed preview must be visible, not rendered as "no subagents"')
+  assert.equal(previewNode.children[0], 'dialog.previewUnavailable')
+  assert.equal(
+    form.props.children.some((child) => child !== null && child.props?.key === 'subagents'),
+    false,
+    'a failed preview must not claim a blast radius of zero either',
+  )
   face.settleSessionDelete()
 }
 

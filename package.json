@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-session-delete",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Delete a Session from the sidebar's \"...\" menu — a destructive row styled with DSH's own MenuItemButton danger colors · 在会话「⋯」菜单末尾添加红色的删除会话选项",
   "keywords": [
     "dsh",
@@ -47,7 +47,7 @@
     "cordis.patch.yml"
   ],
   "scripts": {
-    "test": "node test/manifest.test.mjs && node test/host.test.mjs && node test/client.test.mjs"
+    "test": "node test/manifest.test.mjs && node test/vocabulary.test.mjs && node test/host.test.mjs && node test/client.test.mjs"
   },
   "dsh": {
     "bundle": {

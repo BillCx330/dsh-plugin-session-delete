@@ -15,6 +15,13 @@ const host = await import(new URL('../lib/index.js', import.meta.url).href)
 
 const root = await mkdtemp(join(tmpdir(), 'dsh-session-delete-'))
 
+/** The cwd every seeded Session is stored under. */
+const CWD = 'C:\\proj'
+/** Project directory the real backend derives from that cwd. */
+const PROJECT = '--proj--'
+/** Project directory the real backend derives from a MISSING cwd. */
+const NO_CWD = '_no-cwd'
+
 /** Create one stored session directory under the fake persistence root. */
 async function seedSession(project, sessionId) {
   const dir = join(root, project, sessionId)
@@ -24,7 +31,7 @@ async function seedSession(project, sessionId) {
 }
 
 /** Build a Host context over one fake deployment shape. */
-function makeContext({ live = false, running = false, locate = true, outsidePath, failDetach = false, failUnpin = false, descendants = [] } = {}) {
+function makeContext({ live = false, running = false, locate = true, outsidePath, failDetach = false, failUnpin = false, descendants = [], probeThrows = false, cacheDeleteReturns = true } = {}) {
   const state = {
     detached: [],
     unpinned: [],
@@ -32,6 +39,7 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
     emitted: [],
     cacheDropped: [],
     activityQueries: 0,
+    traceIds: [],
     route: undefined,
     previewRoute: undefined,
   }
@@ -53,13 +61,17 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
     root,
     async stat(id) {
       if (id === 'session-missing' || id === 'session-zombie') return undefined
-      return { header: { id, cwd: 'C:\\proj', version: 4, createdAt: 0, isSeeded: false } }
+      return { header: { id, cwd: CWD, version: 4, createdAt: 0, isSeeded: false } }
     },
     ...(locate
       ? {
+          // Mirrors the shipped JSONL backend: `logPath(root, meta.cwd,
+          // meta.id)`, where an absent `cwd` selects `_no-cwd`. A fake that
+          // ignored `cwd` would hide exactly the bug this file now guards.
           locate(header) {
             if (outsidePath !== undefined) return { kind: 'jsonl', path: outsidePath }
-            return { kind: 'jsonl', path: join(root, '--proj--', header.id, 'session.v4.jsonl.zstd') }
+            const project = header.cwd === undefined ? NO_CWD : PROJECT
+            return { kind: 'jsonl', path: join(root, project, header.id, 'session.v4.jsonl.zstd') }
           },
         }
       : {}),
@@ -117,9 +129,14 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
         case 'sessionQuery':
           return {
             // Lineage shape mirrors the real service: nested `descendants`,
-            // each node a `SessionRecord` with a `header` carrying `origin`.
-            async traceSession() {
-              return { target: { header: { id: 'session-x' } }, ancestors: [], descendants }
+            // each node a `SessionRecord` whose header carries `origin` AND the
+            // `cwd` the artifact is really stored under (`traceSession` clones
+            // the whole record, so a real node always has one). A fixture that
+            // dropped the cwd would make the cascade look correct here while
+            // failing against the shipped backend.
+            async traceSession(id) {
+              state.traceIds.push(id)
+              return { target: { header: { id: 'session-x', cwd: CWD } }, ancestors: [], descendants }
             },
           }
         case 'workspaceRegistry':
@@ -134,6 +151,7 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
                   return {
                     async delete(id) {
                       state.cacheDropped.push(id)
+                      return cacheDeleteReturns
                     },
                   }
                 },
@@ -144,6 +162,13 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
           return undefined
       }
     },
+  }
+
+  if (probeThrows) {
+    ctx.waterfall = async () => {
+      state.activityQueries += 1
+      throw new Error('activity listener blew up')
+    }
   }
 
   return { ctx, state }
@@ -173,7 +198,7 @@ async function post(route, body) {
 /* ------------------------------------------------- happy path deletes it --- */
 
 {
-  const dir = await seedSession('--proj--', 'session-x')
+  const dir = await seedSession(PROJECT, 'session-x')
   const { ctx, state } = makeContext()
   host.apply(ctx)
 
@@ -198,7 +223,7 @@ async function post(route, body) {
 /* ------------------------------------------------- scan fallback (no locate) */
 
 {
-  const dir = await seedSession('--proj--', 'session-x')
+  const dir = await seedSession(PROJECT, 'session-x')
   const { ctx, state } = makeContext({ locate: false })
   host.apply(ctx)
 
@@ -230,35 +255,152 @@ async function post(route, body) {
 }
 
 {
-  // Regression: an attached-but-idle Session MUST still be deletable. The
-  // client retains every visible row (`useSessionStatus`), so "attached" is
-  // the ordinary state of every row in the sidebar — treating it as a refusal
-  // made the plugin refuse every session, which is the bug this test exists
-  // to keep fixed. Only reported activity may block a delete.
-  const dir = await seedSession('--proj--', 'session-live')
+  // A Session the HOST holds live must be refused, even when it is idle.
+  //
+  // This is not the same as a Session the CLIENT has attached. The browser keeps
+  // a `Session` wrapper for every row it renders, which is why attachment alone
+  // is not a reason to refuse (it would refuse the whole sidebar). What this
+  // checks is `sessions.get`/`agents.get` on the Host, where a live Session is
+  // one this process really entered.
+  //
+  // Deleting it cannot stick: `ApiSessionList.list()` unions live Sessions with
+  // persisted ones, so the row returns on the next refresh, and the surviving
+  // Session's writes then fail with ENOENT because its directory is gone.
+  // Nothing in DSH can evict a live Session, so refusing is the only honest
+  // answer until the Host restarts.
+  const dir = await seedSession(PROJECT, 'session-live')
   const { ctx, state } = makeContext({ live: true })
   host.apply(ctx)
 
   const { status, payload } = await post(state.route, { sessionId: 'session-live' })
-  assert.equal(status, 200, 'an attached but idle Session must be deletable')
-  assert.equal(payload.ok, true)
-  assert.equal(payload.artifactRemoved, true)
-  assert.equal(payload.announced, true)
-  assert.equal(state.activityQueries > 0, true, 'running work must still be asked about')
-  await assert.rejects(() => stat(dir), 'the artifact must be gone')
-  assert.deepEqual(state.detached, ['session-live'], 'the workspace slot must be released')
+  assert.equal(status, 409, 'a Host-live Session must be refused')
+  assert.equal(payload.ok, false)
+  assert.equal(payload.code, 'live')
+  assert.equal(await stat(dir).then(() => true), true, 'a refused delete must leave the artifact alone')
+  assert.deepEqual(state.detached, [], 'a refusal must not release the workspace slot')
+  assert.deepEqual(state.emitted, [], 'a refusal must not announce a removal')
+  assert.deepEqual(state.cacheDropped, [], 'a refusal must not drop the cache row')
+  assert.equal(state.activityQueries, 0, 'liveness is settled without asking the activity probe')
+
+  await rm(dir, { recursive: true, force: true })
 }
 
 {
-  const dir = await seedSession('--proj--', 'session-x')
+  // A composition that mounts neither `sessions` nor `agents` must not turn the
+  // new liveness check into a failure: with nothing to read, the Session simply
+  // cannot be known to be live, and a cold deletion proceeds.
+  const dir = await seedSession(PROJECT, 'session-x')
+  const { ctx, state } = makeContext()
+  const baseGet = ctx.get
+  ctx.get = (key) => (key === 'sessions' || key === 'agents' ? undefined : baseGet(key))
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200, 'a composition without a live store must still delete')
+  assert.equal(payload.artifactRemoved, true)
+  await assert.rejects(() => stat(dir))
+}
+
+{
+  // A live AGENT is enough on its own: the two stores the agent factory enters
+  // are `sessions` and `agents`, and a Session can be held by the agent registry
+  // while `sessions.get` has nothing. Dropping the `agents.get` half of the check
+  // must fail here.
+  const dir = await seedSession(PROJECT, 'session-x')
+  const { ctx, state } = makeContext()
+  const baseGet = ctx.get
+  ctx.get = (key) => (key === 'agents' ? { get: (id) => (id === 'session-x' ? { id } : undefined) } : baseGet(key))
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 409, 'a Session held by the agent registry must be refused')
+  assert.equal(payload.code, 'live')
+  assert.equal(await stat(dir).then(() => true), true, 'the artifact must be left alone')
+  assert.deepEqual(state.emitted, [])
+
+  await rm(dir, { recursive: true, force: true })
+}
+
+{
+  // The re-check before the irreversible step must fail closed too. A probe that
+  // works for the first check and then blows up must stop the removal, not be
+  // read as "idle".
+  const dir = await seedSession(PROJECT, 'session-x')
+  const { ctx, state } = makeContext()
+  let calls = 0
+  ctx.waterfall = async () => {
+    calls += 1
+    if (calls > 1) throw new Error('listener blew up mid-delete')
+    return []
+  }
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 500, 'a failing pre-removal re-check must fail the request')
+  assert.equal(payload.code, 'failed')
+  assert.match(payload.message, /artifact removal failed/u)
+  assert.equal(await stat(dir).then(() => true), true, 'the artifact must survive a failed re-check')
+  assert.deepEqual(state.detached, [])
+  assert.deepEqual(state.emitted, [])
+
+  await rm(dir, { recursive: true, force: true })
+}
+
+{
+  // The same, for a child: its own re-check failing must leave that child alone
+  // and be reported, while the parent still goes.
+  await seedSession(PROJECT, 'session-x')
+  const childDir = await seedSession(PROJECT, 'sub-boom')
+  const tree = [{ session: { header: { id: 'sub-boom', cwd: CWD, origin: 'subagent', parentSession: 'session-x' } }, descendants: [] }]
+  const { ctx, state } = makeContext({ descendants: tree })
+  const baseWaterfall = ctx.waterfall
+  ctx.waterfall = async (event, request, next) => {
+    if (request.sessionId === 'sub-boom') throw new Error('child listener blew up')
+    return baseWaterfall(event, request, next)
+  }
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200, 'a failing child probe must not fail the parent deletion')
+  assert.deepEqual(payload.subagentsRemoved, [])
+  assert.equal(payload.subagentWarnings.length, 1)
+  assert.match(payload.subagentWarnings[0], /sub-boom: child listener blew up/u)
+  assert.equal(await stat(childDir).then(() => true), true, 'the child must survive its failed re-check')
+
+  await rm(childDir, { recursive: true, force: true })
+}
+
+{
+  const dir = await seedSession(PROJECT, 'session-x')
   const { ctx, state } = makeContext({ running: true })
   host.apply(ctx)
 
   const { status, payload } = await post(state.route, { sessionId: 'session-x' })
   assert.equal(status, 409)
   assert.equal(payload.code, 'running')
+  assert.equal(state.activityQueries > 0, true, 'the shipped activity probe must be asked about a cold Session')
   await stat(dir)
   assert.deepEqual(state.detached, [])
+  await rm(dir, { recursive: true, force: true })
+}
+
+{
+  // A probe that fails must NOT be read as "idle". Deletion is irreversible, so
+  // the destructive path has to fail closed: the shipped `archiveSession` does
+  // not contain this waterfall either. The caller gets a retryable failure and
+  // the artifact is untouched.
+  const dir = await seedSession(PROJECT, 'session-x')
+  const { ctx, state } = makeContext({ probeThrows: true })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 500, 'a failed activity probe must fail the request, not be treated as idle')
+  assert.equal(payload.ok, false)
+  assert.equal(payload.code, 'failed')
+  assert.equal(await stat(dir).then(() => true), true, 'the artifact must survive a failed probe')
+  assert.deepEqual(state.detached, [], 'a failed probe must not release the workspace slot')
+  assert.deepEqual(state.emitted, [], 'a failed probe must not announce a removal')
+
   await rm(dir, { recursive: true, force: true })
 }
 
@@ -278,6 +420,7 @@ async function post(route, body) {
   assert.equal(status, 500, 'a refused removal is a failure, not a partial success')
   assert.equal(payload.ok, false)
   assert.equal(payload.code, 'failed')
+  assert.match(payload.message, /removal guard \(guard\)/u, 'the message must name the guard, not a generic failure')
   await stat(join(victim, 'keep-me'))
   assert.deepEqual(state.detached, [], 'a Session still on disk must keep its workspace account slot')
   assert.deepEqual(state.emitted, [], 'a refused removal must not announce the Session as gone')
@@ -293,33 +436,41 @@ async function post(route, body) {
   // so a parent that is deleted strands them permanently. They must be removed
   // with it. A fork branch sitting in the same tree is a different thing: an
   // independent copy, and it must NOT be touched.
+  //
+  // Every header carries `cwd`, exactly as `traceSession`'s cloned records do:
+  // the backend derives the artifact path from it (`logPath(root, meta.cwd,
+  // meta.id)`), so a synthetic `{ id }` would name `_no-cwd/<id>` instead of the
+  // real directory and the guard would report "artifact not removed" for a child
+  // that is sitting right there.
   const tree = [
     {
-      session: { header: { id: 'sub-a', origin: 'subagent', parentSession: 'session-x' } },
+      session: { header: { id: 'sub-a', cwd: CWD, origin: 'subagent', parentSession: 'session-x' } },
       descendants: [
         {
-          session: { header: { id: 'sub-a1', origin: 'subagent', parentSession: 'sub-a' } },
+          session: { header: { id: 'sub-a1', cwd: CWD, origin: 'subagent', parentSession: 'sub-a' } },
           descendants: [],
         },
         {
           // A fork branch nested under a subagent: no `origin`, so untouched.
-          session: { header: { id: 'fork-b', parentSession: 'sub-a' } },
+          session: { header: { id: 'fork-b', cwd: CWD, parentSession: 'sub-a' } },
           descendants: [],
         },
       ],
     },
-    { session: { header: { id: 'fork-top', parentSession: 'session-x' } }, descendants: [] },
+    { session: { header: { id: 'fork-top', cwd: CWD, parentSession: 'session-x' } }, descendants: [] },
   ]
-  for (const id of ['session-x', 'sub-a', 'sub-a1']) await seedSession('--proj--', id)
+  for (const id of ['session-x', 'sub-a', 'sub-a1']) await seedSession(PROJECT, id)
   const { ctx, state } = makeContext({ descendants: tree })
   host.apply(ctx)
 
   const { status, payload } = await post(state.route, { sessionId: 'session-x' })
   assert.equal(status, 200)
+  assert.deepEqual(state.traceIds, ['session-x'], 'the trace must be asked about the Session being deleted')
   assert.deepEqual(payload.subagentsRemoved, ['sub-a', 'sub-a1'], 'every subagent descendant must go with its parent, depth-first')
   for (const id of ['session-x', 'sub-a', 'sub-a1']) {
-    await assert.rejects(() => stat(join(root, '--proj--', id)), `${id} must be gone`)
+    await assert.rejects(() => stat(join(root, PROJECT, id)), `${id} must be gone`)
   }
+  assert.equal(payload.subagentWarnings, undefined, 'a clean cascade must not warn')
   assert.ok(!payload.subagentsRemoved.includes('fork-top'), 'a fork branch is not a subagent and must never be removed with its parent')
   assert.deepEqual(state.emitted, [
     ['api-session/removed', 'sub-a'],
@@ -330,13 +481,36 @@ async function post(route, body) {
 }
 
 {
+  // Regression guard for the bug above: a child whose header names a project
+  // directory that does not hold it must be REPORTED, not silently claimed as
+  // removed. This is the shape the old code produced for every child (it passed
+  // `{ id }`, so `locate` answered `_no-cwd/<id>`), and the response has to say
+  // so rather than promise a cascade that did not happen.
+  await seedSession(PROJECT, 'session-x')
+  const childDir = await seedSession(PROJECT, 'sub-orphan')
+  const tree = [{ session: { header: { id: 'sub-orphan', origin: 'subagent', parentSession: 'session-x' } }, descendants: [] }]
+  const { ctx, state } = makeContext({ descendants: tree })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200)
+  assert.deepEqual(payload.subagentsRemoved, [], 'a child without its cwd must not be reported as removed')
+  assert.equal(payload.subagentWarnings.length, 1)
+  assert.match(payload.subagentWarnings[0], /sub-orphan/u)
+  assert.match(payload.subagentWarnings[0], /\(missing\)/u, 'the report must name the real obstacle')
+  assert.equal(await stat(childDir).then(() => true), true, 'the mislocated child stays where it was')
+
+  await rm(childDir, { recursive: true, force: true })
+}
+
+{
   // A failing subagent removal is reported but never blocks the parent or the
   // remaining subagents.
-  await seedSession('--proj--', 'session-x')
-  await seedSession('--proj--', 'sub-ok')
+  await seedSession(PROJECT, 'session-x')
+  await seedSession(PROJECT, 'sub-ok')
   const tree = [
-    { session: { header: { id: 'sub-missing', origin: 'subagent' } }, descendants: [] },
-    { session: { header: { id: 'sub-ok', origin: 'subagent' } }, descendants: [] },
+    { session: { header: { id: 'sub-missing', cwd: CWD, origin: 'subagent' } }, descendants: [] },
+    { session: { header: { id: 'sub-ok', cwd: CWD, origin: 'subagent' } }, descendants: [] },
   ]
   const { ctx, state } = makeContext({ descendants: tree })
   host.apply(ctx)
@@ -348,15 +522,38 @@ async function post(route, body) {
   assert.equal(payload.subagentWarnings.length, 1)
   assert.match(payload.subagentWarnings[0], /sub-missing/u)
   assert.equal(payload.announced, true)
-  await assert.rejects(() => stat(join(root, '--proj--', 'sub-ok')))
+  await assert.rejects(() => stat(join(root, PROJECT, 'sub-ok')))
+}
+
+{
+  // A subagent that is live in the Host is re-checked right before its own
+  // removal and left alone rather than deleted under a writer, and the report
+  // says why instead of leaving a bare "not removed".
+  await seedSession(PROJECT, 'session-x')
+  const childDir = await seedSession(PROJECT, 'sub-live')
+  const tree = [{ session: { header: { id: 'sub-live', cwd: CWD, origin: 'subagent', parentSession: 'session-x' } }, descendants: [] }]
+  const { ctx, state } = makeContext({ descendants: tree })
+  const liveSessions = { get: (id) => (id === 'sub-live' ? { id } : undefined) }
+  const baseGet = ctx.get
+  ctx.get = (key) => (key === 'sessions' ? liveSessions : baseGet(key))
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200)
+  assert.deepEqual(payload.subagentsRemoved, [])
+  assert.equal(payload.subagentWarnings.length, 1)
+  assert.match(payload.subagentWarnings[0], /sub-live: artifact not removed \(live\)/u)
+  assert.equal(await stat(childDir).then(() => true), true, 'a live child must survive')
+
+  await rm(childDir, { recursive: true, force: true })
 }
 
 {
   // The preview route is read-only and reports the blast radius.
-  await seedSession('--proj--', 'session-x')
+  await seedSession(PROJECT, 'session-x')
   const tree = [
-    { session: { header: { id: 'sub-a', origin: 'subagent' } }, descendants: [] },
-    { session: { header: { id: 'fork-top', parentSession: 'session-x' } }, descendants: [] },
+    { session: { header: { id: 'sub-a', cwd: CWD, origin: 'subagent' } }, descendants: [] },
+    { session: { header: { id: 'fork-top', cwd: CWD, parentSession: 'session-x' } }, descendants: [] },
   ]
   const { ctx, state } = makeContext({ descendants: tree })
   host.apply(ctx)
@@ -365,7 +562,7 @@ async function post(route, body) {
   assert.equal(status, 200)
   assert.deepEqual(payload.subagentIds, ['sub-a'], 'the preview counts subagents only, not fork branches')
   assert.equal(
-    await stat(join(root, '--proj--', 'session-x')).then(() => true, () => false),
+    await stat(join(root, PROJECT, 'session-x')).then(() => true, () => false),
     true,
     'the preview must not delete anything',
   )
@@ -426,7 +623,7 @@ async function post(route, body) {
   // The artifact is gone but the workspace detach throws. That must stay a
   // success: the Session really is deleted, and failing the request is what
   // leaves the client holding a phantom row for a Session that is gone.
-  const dir = await seedSession('--proj--', 'session-x')
+  const dir = await seedSession(PROJECT, 'session-x')
   const { ctx, state } = makeContext({ failDetach: true })
   host.apply(ctx)
 
@@ -445,7 +642,7 @@ async function post(route, body) {
 {
   // An unpin that throws must not stop unarchive/detach from running, and must
   // not stop the removal from being announced.
-  const dir = await seedSession('--proj--', 'session-x')
+  const dir = await seedSession(PROJECT, 'session-x')
   const { ctx, state } = makeContext({ failUnpin: true })
   host.apply(ctx)
 
@@ -460,19 +657,50 @@ async function post(route, body) {
 }
 
 {
-  // The active-work probe is the shipped one, and a reported job blocks the
-  // delete before anything is touched.
-  const dir = await seedSession('--proj--', 'session-x')
-  const { ctx, state } = makeContext({ running: true })
+  // `KvTableImpl.delete` resolves `false` when the key is absent, so
+  // `cacheRowDropped` has to report what really happened instead of a constant
+  // `true` — that field is the only way to answer "did the cache row go away?".
+  const dir = await seedSession(PROJECT, 'session-x')
+  const { ctx, state } = makeContext({ cacheDeleteReturns: false })
   host.apply(ctx)
 
   const { status, payload } = await post(state.route, { sessionId: 'session-x' })
-  assert.equal(status, 409)
-  assert.equal(payload.code, 'running')
-  assert.equal(state.activityQueries > 0, true, 'the shipped activity probe must be asked')
-  await stat(dir)
-  assert.deepEqual(state.detached, [])
-  assert.deepEqual(state.emitted, [])
+  assert.equal(status, 200, 'an absent cache row is not a failure')
+  assert.equal(payload.cacheRowDropped, false, 'an absent cache row must be reported as not dropped')
+  await rm(dir, { recursive: true, force: true })
+}
+
+{
+  // The workspace release must not depend on `Workspace.sessionIds`, which is a
+  // FILTERED getter over an in-memory index the plugin does not control: a
+  // re-index between the `rm` and the release can hide the id while the durable
+  // record still accounts for it. The release is unconditional; the filtered
+  // getter only decides what the response reports.
+  const dir = await seedSession(PROJECT, 'session-x')
+  const { ctx, state } = makeContext()
+  const hidden = {
+    id: 'ws-hidden',
+    // The getter says "not mine" — the release must happen anyway.
+    sessionIds: [],
+    async detachSession(id) {
+      state.detached.push(id)
+    },
+  }
+  const baseGet = ctx.get
+  ctx.get = (key) =>
+    key === 'workspaceRegistry'
+      ? {
+          async unpinSession() {},
+          async unarchiveSession() {},
+          list: () => [hidden],
+        }
+      : baseGet(key)
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200)
+  assert.deepEqual(state.detached, ['session-x'], 'the release must run even when the filtered getter hides the id')
+  assert.deepEqual(payload.detachedFrom, [], 'a workspace that does not list the Session is not reported as detached')
   await rm(dir, { recursive: true, force: true })
 }
 
@@ -480,7 +708,7 @@ async function post(route, body) {
 
 {
   const projects = await readdir(root)
-  assert.deepEqual(projects, ['--proj--'], 'the fake root must still hold only its project directory')
+  assert.deepEqual(projects, [PROJECT], 'the fake root must still hold only its project directory')
 }
 
 await rm(root, { recursive: true, force: true })
