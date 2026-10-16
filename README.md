@@ -41,10 +41,8 @@ The Host exposes no delete verb either: `sessionPersistence` has only `create` /
 The Host half runs these steps in order:
 
 1. **Read the stored header** — `sessionPersistence.stat(sessionId)`. With nothing stored the Session is *already gone*: the request still succeeds and finishes the bookkeeping (see *An already-gone Session is still removable*).
-2. **Refuse a Session this Host still holds live** — `sessions.get(id)` / `agents.get(id)` → `live`. A live Session is one this process entered: the conversation open right now, plus every conversation resumed since startup. Nothing evicts one while the process lives (a Session's detach disposer runs when the fiber that created it is disposed, and the `agents` service exposes no dispose verb), so the delete cannot stick: `ApiSessionList.list()` unions live Sessions with persisted ones, which brings the row straight back on the next refresh, and the surviving Session's writes then fail with ENOENT because its directory is gone. Restart Harness and delete it then — see *A live Session is refused*.
-
-   Being merely *attached in the browser* is deliberately not a refusal. The client keeps a `Session` wrapper for every row it renders so the status dot has a source, which is a client-side fact: refusing on it would refuse the whole sidebar. `sessions.get`/`agents.get` are the Host's own live store, so they refuse only what was really entered.
-3. **Refuse a Session that still has running work** — anything reported by the shipped `workspace/session-activity` probe (the turn in progress, running subagents, background jobs, scheduled reminders) → `running`. That is the same read-only probe the archive flow asks before it refuses, so deleting a Session cannot orphan a job or leave a schedule firing at a Session that is gone.
+2. **Read — but never refuse on — whether the Host holds the Session live** (`sessions.get(id)` / `agents.get(id)`). This is a *report*: the response carries `liveInMemory` and `liveSource` (`'sessions'` or `'agents'`), and the dialog warns before the user confirms. It is deliberately not a refusal, and that is a reversal of what 1.2.0 did: in the desktop app with its bundles mounted, the live store can answer for every Session a user can see, so refusing the live ones refused **every** row and the plugin could no longer delete anything. A rule that cannot delete anything is not honesty, it is a bug. See *A live Session is reported, not refused*.
+3. **Refuse a Session that still has running work** — anything reported by the shipped `workspace/session-activity` probe (the turn in progress, running subagents, background jobs, scheduled reminders) → `running`. That is the same read-only probe the archive flow asks before it refuses, so deleting a Session cannot orphan a job or leave a schedule firing at a Session that is gone. This is the only refusal left.
 
    A probe that **fails** fails the request rather than being read as "idle" (`archiveSession` does not swallow this waterfall either). Deletion is irreversible, so a probe that cannot answer must not be permission; the cost of failing closed is a retryable `failed`, the cost of failing open is deleting a Session that was mid-write.
 
@@ -69,35 +67,39 @@ Each child is removed through **its own stored header** — the one the trace ha
 
 **Fork branches are deliberately left alone** — they are independent copies and survive the parent intact, promoted to top-level rows in the sidebar. The confirmation dialog states both facts before anything is destroyed: how many subagents go with the Session, and that branched conversations stay.
 
-Each subagent removal is best-effort and individually reported; one that fails stops neither the parent deletion nor the remaining children, and the report says *why* (a child that woke up is refused as `live`/`running`). Failures are shown in the dialog rather than only logged, so a cascade that did not fully happen is never presented as one that did.
+Each subagent removal is best-effort and individually reported; one that fails stops neither the parent deletion nor the remaining children, and the report says *why* (a child whose own probe reported work is refused as `running`). Failures are shown in the dialog rather than only logged, so a cascade that did not fully happen is never presented as one that did.
 
-### A live Session is refused
+### A live Session is reported, not refused
 
-The Host removes the Session's *artifact*, but it cannot remove the Session the
-running process still holds in memory — DSH exposes no dispose verb for that
-(`agents` has `create`/`resume`/`get`/`list`; a Session's detach disposer belongs
-to the fiber that entered it). So the delete cannot stick:
+The Host removes the Session's *artifact*. It cannot remove the Session the
+running process still holds in memory — DSH exposes no dispose verb the plugin
+can reach (`agents.create`/`resume` return an `AgentHandle` whose `dispose()`
+belongs to the caller, not to a third party). So part of the picture is outside
+the plugin's reach:
 
-- the artifact directory is removed and the row disappears — it looks like a
-  success;
+- the artifact, the workspace slot and the cache row are really removed, and the
+  removal is announced, so the row disappears immediately;
 - the live Session object is still in the store, and `ApiSessionList.list()`
-  unions live Sessions with persisted ones, so **the row comes back** on the next
-  list refresh or reconnect;
-- the Session's log can no longer be appended to (the JSONL append opens
-  `session.vN.jsonl.zst` for append, and its parent directory is gone), so the
-  Session is left as a zombie that can be opened but not written to;
-- the projection-cache row the plugin just deleted is rebuilt by the next
-  `session/event` flush.
+  unions live Sessions with persisted ones, so **the row can come back** on the
+  next list rebuild (reconnect or page refresh) — and deleting it again dismisses
+  it again, because that path is idempotent;
+- until Harness restarts, that Session's log can no longer be appended to, and a
+  turn sent to it will fail.
 
-Refusing is therefore the honest answer, and it is the one the archive path's
-own probe cannot give (archiving writes a durable flag, which *is* reversible, so
-it only refuses running work). A refusal is `409` with `code: 'live'`; the copy
-tells the user to restart Harness and delete it then. The artifact, the workspace
-accounting and the projection cache are all untouched.
+**1.2.1 reports this; 1.2.0 refused it, and that was wrong.** Refusing looked
+honest, but the live store in a real deployment (the desktop app with its bundles
+mounted) can answer for *every* Session a user can see, which made the rule "refuse
+everything" — the plugin could not delete anything at all. A rule that cannot
+delete anything is not honesty, it is a bug. So the delete proceeds, the response
+carries `liveInMemory` and `liveSource`, and the dialog warns **before** the user
+confirms that the row can return:
 
-An **idle** Session that has merely been opened in this process is refused too —
-being open is enough to make the row return. Sessions never entered by this
-process (every other row in the sidebar) delete normally.
+> This session is live in the running process: the log will be deleted, but the
+> row may come back until you refresh or reconnect (a Harness restart removes it
+> for good).
+
+Only **running** work still refuses — the one case where a writer really is
+holding the artifact.
 
 ### An already-gone Session is still removable
 
@@ -146,9 +148,9 @@ Removal is the one irreversible step, so the target is proven before it is touch
 - its final segment must be exactly the requested session id;
 - it must sit strictly inside the persistence root;
 - it must be a real directory — a symlink or junction at that path is refused rather than unlinked, because a link is not evidence that this Session owns what is behind it (recursion never follows one either: both cases were measured, not assumed);
-- liveness and activity are re-checked immediately before the irreversible step — for the Session itself and for every subagent child.
+- liveness is read and activity is re-checked immediately before the irreversible step — for the Session itself and for every subagent child.
 
-That re-check narrows the window rather than closing it, and the code says so instead of pretending otherwise: opening a Session in the browser can promote and resume it asynchronously (the history controller's `follow` → `promote` → `agents.resume`), so a Session that passed both checks can still be entered while `rm` runs. The artifact is gone by then, so the request cannot be "un-succeeded"; instead the success payload reports `liveInMemory: true` and the dialog says so, turning a silent resurrection into an announced one. A refused removal names its real obstacle in the message (`live`, `running`, `guard`, `missing`, …).
+That activity re-check narrows the window rather than closing it, and the code says so instead of pretending otherwise: opening a Session in the browser can promote and resume it asynchronously (the history controller's `follow` → `promote` → `agents.resume`), so a Session that passed the check can still be entered while `rm` runs. Being entered is reported, not fatal — the artifact is already gone by then, and the success payload says `liveInMemory: true`. A refused removal names its real obstacle in the message (`running`, `guard`, `missing`, …).
 
 When the guard refuses, the request fails and **nothing else changes**: workspace accounting, projection cache, and the client's list all stay as they were.
 
@@ -232,7 +234,7 @@ None. It appends nothing to any session history — deleting a session removes a
 These are current plugin constraints, not a backlog.
 
 - **A Session with running work is refused** (turn, subagents, jobs, schedules); stop it first.
-- **A Session the Host still holds live is refused** until Harness restarts — deleting it cannot stick, because the row returns and its log can no longer be written. Merely having the sidebar render a row is not "live".
+- **A Session the Host still holds live is deleted anyway and reported**: `liveInMemory` + `liveSource` say the row can come back until Harness restarts (re-delete, or restart). It is not a refusal — refusing it refused every row in practice.
 - **Subagent descendants are deleted with their parent**; fork branches are not — they are independent copies and stay. Both are stated in the confirmation dialog.
 - **A partial result is never presented as a clean one**: if a subagent cannot be removed, or a cleanup step fails, the dialog stays open and says which.
 - **A symlink or junction at the artifact path is refused**, not followed and not unlinked.

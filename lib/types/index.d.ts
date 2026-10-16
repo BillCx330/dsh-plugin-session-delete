@@ -22,10 +22,13 @@ export declare const SESSION_DELETE_PREVIEW_PATH: '/api/session.delete.preview'
  * locale dictionaries, and to its `KNOWN_FAILURE_CODES`; `test/vocabulary.test.mjs`
  * fails when any of them drifts. `'network'` is deliberately absent: the Client
  * synthesizes it when the Host could not be reached, so it has no Host code.
+ *
+ * There is deliberately no "live" code: a Session the Host still holds is
+ * reported through `liveInMemory`/`liveSource` on a successful response, because
+ * refusing it refuses every Session a deployment can see.
  */
 export declare const SESSION_DELETE_CODES: readonly [
   'bad-request',
-  'live',
   'running',
   'unavailable',
   'failed',

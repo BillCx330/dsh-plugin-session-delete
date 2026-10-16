@@ -215,7 +215,7 @@ const previewIds = ['sub-1', 'sub-2']
 const previewCalls = []
 const facePreview = async (sessionId) => {
   previewCalls.push(sessionId)
-  return previewIds
+  return { ids: previewIds, live: false }
 }
 
 resetHooks()
@@ -314,10 +314,14 @@ assert.equal(face.hooks.deletePending.getSnapshot(), null)
   const previewCalls = []
   globalThis.fetch = async (url, init) => {
     previewCalls.push({ url, init })
-    return { ok: true, json: async () => ({ ok: true, subagentIds: ['a', 'b'] }) }
+    return { ok: true, json: async () => ({ ok: true, subagentIds: ['a', 'b'], live: true, liveSource: 'agents' }) }
   }
 
-  assert.deepEqual(await face.preview('session-abc'), ['a', 'b'], 'the real preview hop must return the ids')
+  assert.deepEqual(
+    await face.preview('session-abc'),
+    { ids: ['a', 'b'], live: true },
+    'the real preview hop must return the ids and the liveness it read',
+  )
   assert.equal(previewCalls.length, 1)
   assert.equal(previewCalls[0].url, '/api/session.delete.preview', 'the preview must never call the destructive route')
   assert.equal(previewCalls[0].init.method, 'POST')
@@ -328,10 +332,10 @@ assert.equal(face.hooks.deletePending.getSnapshot(), null)
     status: 500,
     json: async () => ({ ok: false, code: 'failed' }),
   })
-  assert.equal(await face.preview('session-abc'), null, 'a Host failure must read as "unknown", not "none"')
+  assert.deepEqual(await face.preview('session-abc'), { ids: null, live: false }, 'a Host failure must read as "unknown", not "none"')
 
   globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true }) })
-  assert.equal(await face.preview('session-abc'), null, 'a payload without subagentIds must read as "unknown"')
+  assert.deepEqual(await face.preview('session-abc'), { ids: null, live: false }, 'a payload without subagentIds must read as "unknown"')
 
   globalThis.fetch = async () => ({
     ok: true,
@@ -339,12 +343,12 @@ assert.equal(face.hooks.deletePending.getSnapshot(), null)
       throw new Error('not json')
     },
   })
-  assert.equal(await face.preview('session-abc'), null, 'an unreadable body must read as "unknown"')
+  assert.deepEqual(await face.preview('session-abc'), { ids: null, live: false }, 'an unreadable body must read as "unknown"')
 
   globalThis.fetch = async () => {
     throw new Error('offline')
   }
-  assert.equal(await face.preview('session-abc'), null, 'an unreachable Host must read as "unknown"')
+  assert.deepEqual(await face.preview('session-abc'), { ids: null, live: false }, 'an unreachable Host must read as "unknown"')
 }
 
 globalThis.fetch = async () => ({
@@ -378,7 +382,6 @@ const renderForm = () => {
 }
 
 for (const [code, expected] of [
-  ['live', 'error.live'],
   ['running', 'error.running'],
   ['brand-new-failure-code', 'error.failed'],
 ]) {
@@ -433,17 +436,17 @@ for (const [code, expected] of [
     ok: true,
     sessionId: 'session-warn',
     artifactRemoved: true,
-    subagentWarnings: ['sub-x: artifact not removed (live)'],
+    subagentWarnings: ['sub-x: artifact not removed (running)'],
     liveInMemory: true,
   })
 
   face.requestSessionDelete('session-warn', 'A title')
   resetHooks()
-  let form = render(deleteSession, async () => [])
+  let form = render(deleteSession, async () => ({ ids: [], live: false }))
   await form.props.footer.children[1].props.onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
   React.__cursor = 0
-  form = render(deleteSession, async () => [])
+  form = render(deleteSession, async () => ({ ids: [], live: false }))
 
   assert.equal(settledCount, 0, 'a reported partial result must keep the dialog open')
   assert.equal(form.props.description, 'dialog.deleted', 'the dialog must say the Session is gone')
@@ -460,7 +463,7 @@ for (const [code, expected] of [
   )
   assert.deepEqual(
     localized.filter(([key]) => key === 'dialog.warn.subagents'),
-    [['dialog.warn.subagents', { detail: 'sub-x: artifact not removed (live)' }]],
+    [['dialog.warn.subagents', { detail: 'sub-x: artifact not removed (running)' }]],
     'the child id must reach the localized sentence',
   )
 
@@ -485,10 +488,10 @@ for (const [code, expected] of [
     return element === null ? null : element.type(element.props)
   }
 
-  let form = render(async () => null)
+  let form = render(async () => ({ ids: null, live: false }))
   await new Promise((resolve) => setTimeout(resolve, 0))
   React.__cursor = 0
-  form = render(async () => null)
+  form = render(async () => ({ ids: null, live: false }))
 
   const previewNode = form.props.children.find((child) => child !== null && child.props?.key === 'preview')
   assert.ok(previewNode, 'a failed preview must be visible, not rendered as "no subagents"')
@@ -498,6 +501,42 @@ for (const [code, expected] of [
     false,
     'a failed preview must not claim a blast radius of zero either',
   )
+  face.settleSessionDelete()
+}
+
+/* ------------------- a live Session is warned about BEFORE confirming --- */
+
+// Liveness no longer blocks the deletion, so the preview drives a warning that
+// arrives while the user is still deciding; the alternative is a row that comes
+// back later as a surprise.
+{
+  face.requestSessionDelete('session-live', 'A title')
+  resetHooks()
+  const render = (preview) => {
+    const element = overlay.component({
+      useDeletePending: (selector) => selector(face.hooks.deletePending.getSnapshot()),
+      settleSessionDelete: face.settleSessionDelete,
+      deleteSession: async () => ({ ok: true }),
+      preview,
+      t: (key) => key,
+    })
+    return element === null ? null : element.type(element.props)
+  }
+
+  let form = render(async () => ({ ids: [], live: true }))
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  React.__cursor = 0
+  form = render(async () => ({ ids: [], live: true }))
+
+  const liveNode = form.props.children.find((child) => child !== null && child.props?.key === 'live')
+  assert.ok(liveNode, 'a live Session must be warned about before the user confirms')
+  assert.equal(liveNode.props.role, 'note')
+  assert.equal(liveNode.children[0], 'dialog.liveWarning')
+
+  // The confirm action stays available: the warning informs, it does not block.
+  const confirm = form.props.footer.children[1]
+  assert.equal(confirm.props.disabled, false, 'the warning must not disable the destructive action')
+
   face.settleSessionDelete()
 }
 

@@ -255,34 +255,26 @@ async function post(route, body) {
 }
 
 {
-  // A Session the HOST holds live must be refused, even when it is idle.
-  //
-  // This is not the same as a Session the CLIENT has attached. The browser keeps
-  // a `Session` wrapper for every row it renders, which is why attachment alone
-  // is not a reason to refuse (it would refuse the whole sidebar). What this
-  // checks is `sessions.get`/`agents.get` on the Host, where a live Session is
-  // one this process really entered.
-  //
-  // Deleting it cannot stick: `ApiSessionList.list()` unions live Sessions with
-  // persisted ones, so the row returns on the next refresh, and the surviving
-  // Session's writes then fail with ENOENT because its directory is gone.
-  // Nothing in DSH can evict a live Session, so refusing is the only honest
-  // answer until the Host restarts.
+  // A Session the HOST holds live is DELETED, not refused, and the response says
+  // so. An earlier design refused it; in a real deployment the live store can
+  // answer for every Session a user can see, which turned that rule into "refuse
+  // everything" and made the plugin unable to delete at all. What the live case
+  // really costs is bounded and is reported instead: the row can come back on the
+  // next list rebuild (reconnect or refresh), and re-deleting is idempotent.
   const dir = await seedSession(PROJECT, 'session-live')
   const { ctx, state } = makeContext({ live: true })
   host.apply(ctx)
 
   const { status, payload } = await post(state.route, { sessionId: 'session-live' })
-  assert.equal(status, 409, 'a Host-live Session must be refused')
-  assert.equal(payload.ok, false)
-  assert.equal(payload.code, 'live')
-  assert.equal(await stat(dir).then(() => true), true, 'a refused delete must leave the artifact alone')
-  assert.deepEqual(state.detached, [], 'a refusal must not release the workspace slot')
-  assert.deepEqual(state.emitted, [], 'a refusal must not announce a removal')
-  assert.deepEqual(state.cacheDropped, [], 'a refusal must not drop the cache row')
-  assert.equal(state.activityQueries, 0, 'liveness is settled without asking the activity probe')
-
-  await rm(dir, { recursive: true, force: true })
+  assert.equal(status, 200, 'a Host-live Session must still be deletable')
+  assert.equal(payload.ok, true)
+  assert.equal(payload.artifactRemoved, true)
+  assert.equal(payload.liveInMemory, true, 'the response must report that the Host still holds it')
+  assert.equal(payload.liveSource, 'sessions', 'and which store held it')
+  assert.equal(await stat(dir).then(() => true, () => false), false, 'the artifact must be gone')
+  assert.deepEqual(state.detached, ['session-live'], 'the workspace slot must be released')
+  assert.deepEqual(state.emitted, [['api-session/removed', 'session-live']], 'the row must be announced')
+  assert.equal(state.activityQueries > 0, true, 'the activity probe is still asked')
 }
 
 {
@@ -305,7 +297,7 @@ async function post(route, body) {
   // A live AGENT is enough on its own: the two stores the agent factory enters
   // are `sessions` and `agents`, and a Session can be held by the agent registry
   // while `sessions.get` has nothing. Dropping the `agents.get` half of the check
-  // must fail here.
+  // must fail here, and `liveSource` must name the store that matched.
   const dir = await seedSession(PROJECT, 'session-x')
   const { ctx, state } = makeContext()
   const baseGet = ctx.get
@@ -313,12 +305,12 @@ async function post(route, body) {
   host.apply(ctx)
 
   const { status, payload } = await post(state.route, { sessionId: 'session-x' })
-  assert.equal(status, 409, 'a Session held by the agent registry must be refused')
-  assert.equal(payload.code, 'live')
-  assert.equal(await stat(dir).then(() => true), true, 'the artifact must be left alone')
-  assert.deepEqual(state.emitted, [])
-
-  await rm(dir, { recursive: true, force: true })
+  assert.equal(status, 200, 'an agent-held Session must still be deletable')
+  assert.equal(payload.artifactRemoved, true)
+  assert.equal(payload.liveInMemory, true)
+  assert.equal(payload.liveSource, 'agents', 'the agent registry is the store that held it')
+  assert.equal(await stat(dir).then(() => true, () => false), false)
+  assert.deepEqual(state.emitted, [['api-session/removed', 'session-x']])
 }
 
 {
@@ -526,9 +518,10 @@ async function post(route, body) {
 }
 
 {
-  // A subagent that is live in the Host is re-checked right before its own
-  // removal and left alone rather than deleted under a writer, and the report
-  // says why instead of leaving a bare "not removed".
+  // A subagent held by the Host does NOT stop its removal: the parent's cascade
+  // deletes it like any other child. Being live is a report, not a veto — for
+  // children as much as for the parent — because otherwise a Host that holds
+  // every child would strand them all with the parent gone.
   await seedSession(PROJECT, 'session-x')
   const childDir = await seedSession(PROJECT, 'sub-live')
   const tree = [{ session: { header: { id: 'sub-live', cwd: CWD, origin: 'subagent', parentSession: 'session-x' } }, descendants: [] }]
@@ -540,10 +533,28 @@ async function post(route, body) {
 
   const { status, payload } = await post(state.route, { sessionId: 'session-x' })
   assert.equal(status, 200)
-  assert.deepEqual(payload.subagentsRemoved, [])
+  assert.deepEqual(payload.subagentsRemoved, ['sub-live'], 'a live child still goes with its parent')
+  assert.equal(payload.subagentWarnings, undefined, 'and is not reported as a failure')
+  assert.equal(await stat(childDir).then(() => true, () => false), false, 'the child artifact must be gone')
+}
+
+{
+  // A child with work in flight is the case that still refuses to touch it.
+  await seedSession(PROJECT, 'session-x')
+  const childDir = await seedSession(PROJECT, 'sub-busy')
+  const tree = [{ session: { header: { id: 'sub-busy', cwd: CWD, origin: 'subagent', parentSession: 'session-x' } }, descendants: [] }]
+  const { ctx, state } = makeContext({ descendants: tree })
+  const baseWaterfall = ctx.waterfall
+  ctx.waterfall = async (event, request, next) =>
+    request.sessionId === 'sub-busy' ? [{ kind: 'job', items: [{ id: 'job-1' }] }] : baseWaterfall(event, request, next)
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200)
+  assert.deepEqual(payload.subagentsRemoved, [], 'a running child must not be deleted under its writer')
   assert.equal(payload.subagentWarnings.length, 1)
-  assert.match(payload.subagentWarnings[0], /sub-live: artifact not removed \(live\)/u)
-  assert.equal(await stat(childDir).then(() => true), true, 'a live child must survive')
+  assert.match(payload.subagentWarnings[0], /sub-busy: artifact not removed \(running\)/u)
+  assert.equal(await stat(childDir).then(() => true), true, 'the running child survives')
 
   await rm(childDir, { recursive: true, force: true })
 }
@@ -561,12 +572,28 @@ async function post(route, body) {
   const { status, payload } = await post(state.previewRoute, { sessionId: 'session-x' })
   assert.equal(status, 200)
   assert.deepEqual(payload.subagentIds, ['sub-a'], 'the preview counts subagents only, not fork branches')
+  assert.equal(payload.live, false, 'a cold Session previews as not live')
   assert.equal(
     await stat(join(root, PROJECT, 'session-x')).then(() => true, () => false),
     true,
     'the preview must not delete anything',
   )
   assert.deepEqual(state.emitted, [], 'the preview must not announce a removal')
+}
+
+{
+  // The preview reports liveness so the dialog can warn BEFORE the user
+  // confirms: since it no longer blocks the delete, warning afterwards would be
+  // the only notice, and the row coming back would be a surprise.
+  await seedSession(PROJECT, 'session-live')
+  const { ctx, state } = makeContext({ live: true })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.previewRoute, { sessionId: 'session-live' })
+  assert.equal(status, 200)
+  assert.equal(payload.live, true, 'the preview must report that the Host holds the Session')
+  assert.equal(payload.liveSource, 'sessions')
+  assert.equal(await stat(join(root, PROJECT, 'session-live')).then(() => true, () => false), true, 'the preview stays read-only')
 }
 
 /* ------------------- a row whose artifact is gone must still be dismissable */

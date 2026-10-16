@@ -7,7 +7,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > **A note on versions.** This repository was first published at 1.2.0. The 1.0.0
 > and 1.1.0 entries below describe work done before that first push: their
 > commits are part of the initial history, but they were never tagged or
-> released, so `v1.2.0` is the only version with a release page.
+> released, so `v1.2.0` is the earliest version with a release page.
+
+## [1.2.1] - 2026-10-16
+
+### Fixed
+
+- **1.2.0 refused every deletion on a real deployment.** The live check it
+  introduced turned out to be unusable as a hard refusal: in the desktop app
+  with its bundles mounted, the Host's live store can answer for every Session a
+  user can see, so `code: 'live'` came back for every row and the plugin could no
+  longer delete anything at all. A rule that cannot delete anything is not
+  honesty, it is a bug.
+
+### Changed
+
+- **A Session the Host still holds is REPORTED, not refused.** The deletion
+  proceeds — artifact, workspace slot, cache row, announcement — and the response
+  carries `liveInMemory` plus `liveSource` (`'sessions'` or `'agents'`) to say
+  which store held it. What the live case actually costs is bounded and is now
+  stated instead of blocked: the row can come back on the next list rebuild
+  (reconnect or page refresh), and the same delete is idempotent, so deleting it
+  again dismisses it.
+- **`live` is gone from `SESSION_DELETE_CODES`, both dictionaries and both
+  `.d.ts` files**, and the confirmation dialog warns BEFORE the user confirms:
+  the preview route reports liveness and the dialog shows a note that the row can
+  return until Harness restarts. The post-deletion warning was reworded to match.
+- **Only work in flight refuses a deletion.** The `running` refusal is unchanged
+  and is still re-checked immediately before removal, for the parent and for every
+  child. A child the Host merely holds live is now removed together with its
+  parent instead of being left behind — which is the whole point of the 1.2.0
+  cascade fix.
 
 ## [1.2.0] - 2026-10-14
 
@@ -220,4 +250,5 @@ First release.
   root before anything is removed.
 - Live/attached sessions are refused rather than force-deleted.
 
+[1.2.1]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.2.1
 [1.2.0]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.2.0
