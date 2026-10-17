@@ -53,6 +53,7 @@ The Host half runs these steps in order:
    - **Release the workspace account slot** — `unpinSession`, `unarchiveSession`, then `detachSession` on every `Workspace` **unconditionally**, removing the session from `workspace.json` for real. (`Workspace.sessionIds` is a *filtered* getter over an in-memory index the plugin does not control, so it decides what the response reports, never whether the release runs; `detachSession` is idempotent.)
    - **Remove the subagent descendants** — see *Subagents go with their parent* below.
    - **Drop the projection-cache row** — through the domain that owns it, so the in-memory table and the durable file stay coherent, rather than deleting the medium directly: `storageDomain.get('session_projcache').table('sessions').delete(id)`. `cacheRowDropped` reports the table's real answer, so an absent row is not mistaken for a dropped one.
+   - **Delete the scheduled reminders bound to it** — a reminder is a durable row keyed by its Session, so `schedule.catalog()` is walked and every task whose `sessionId` is the deleted Session is removed through the service's own `delete({ id, sessionId })` (which refuses a mismatched owner). Reported as `scheduledTasksRemoved`; a task that cannot be deleted becomes a `cleanupWarning`. Without the (experimental) schedule bundle there is nothing to purge.
    - **Announce the removal** — `ctx.emit('api-session/removed', sessionId)`, always, whatever the others did.
 
 ### Subagents go with their parent

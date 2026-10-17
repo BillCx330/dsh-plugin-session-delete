@@ -53,6 +53,7 @@ Host 半部按以下顺序执行：
    - **释放工作区账户位置** — `unpinSession`、`unarchiveSession`，再对每个 `Workspace` **无条件**调用 `detachSession`，把会话从 `workspace.json` 的账目里真正移除。（`Workspace.sessionIds` 是建立在**内存索引**之上的**过滤后 getter**，所以它只决定响应里报告什么，绝不决定要不要释放；`detachSession` 本身是幂等的。）
    - **删除子代理会话** —— 见下方「子代理随父会话一起删除」。
    - **清掉投影缓存行** — 通过拥有它的存储域删除，而不是绕过域直接删文件，这样内存表与磁盘文件保持一致：`storageDomain.get('session_projcache').table('sessions').delete(id)`。`cacheRowDropped` 报告的是这张表给出的真实结果，因此"行本来就不存在"不会被误报成"已删除"。
+   - **删除绑定到它的定时提醒** — 定时任务是按会话 key 持久化的行，所以会遍历 `schedule.catalog()`，把 `sessionId` 等于被删会话的任务通过服务自己的 `delete({ id, sessionId })` 删除（不匹配的 owner 会被服务拒绝）。结果以 `scheduledTasksRemoved` 报告；删不掉的任务变成 `cleanupWarning`。没有挂载（实验性）schedule bundle 时无事可做。
    - **广播移除事件** — `ctx.emit('api-session/removed', sessionId)`，**无论其余步骤结果如何都一定会发**。
 
 ### 子代理随父会话一起删除

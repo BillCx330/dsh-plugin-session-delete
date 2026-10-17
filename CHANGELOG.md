@@ -9,6 +9,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > commits are part of the initial history, but they were never tagged or
 > released, so `v1.2.0` is the earliest version with a release page.
 
+## [1.2.3] - 2026-10-18
+
+### Added
+
+- **Scheduled reminders are deleted with their Session.** A reminder is a durable
+  row keyed by its Session (`schedule` domain), so deleting the Session left the
+  row behind: it could never fire again, but it stayed in `catalog()` and in the
+  reminders panel forever. Cleanup now walks `schedule.catalog()` and removes every
+  task whose `sessionId` is the deleted Session, through the service's own
+  `delete({ id, sessionId })` verb (which refuses a mismatched owner). The count is
+  reported as `scheduledTasksRemoved`; a task that cannot be deleted becomes a
+  `cleanupWarning` and never fails the deletion. Compositions without the
+  (experimental) schedule bundle are unaffected.
+
+### Notes
+
+- Found by a real-store audit after several deletions: no orphaned subagent
+  Sessions, no stale projection-cache rows, no stale `workspace.json` entries and
+  no stray files — only reminders bound to a Session deleted on 2026-10-07, which
+  this release prevents from recurring. Attachment objects are still deliberately
+  kept (they are content-addressed and may be shared by several Sessions).
+
 ## [1.2.2] - 2026-10-17
 
 ### Changed
@@ -288,6 +310,7 @@ First release.
   root before anything is removed.
 - Live/attached sessions are refused rather than force-deleted.
 
+[1.2.3]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.2.3
 [1.2.2]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.2.2
 [1.2.1]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.2.1
 [1.2.0]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.2.0

@@ -363,6 +363,65 @@ async function post(route, body) {
 }
 
 {
+  // Scheduled reminders are durable rows keyed by their Session, so deleting a
+  // Session must delete them too — otherwise every `catalog()` keeps reading
+  // tasks that can never fire. Only tasks the deleted Session owns are touched,
+  // and the service's own delete verb takes both identities.
+  const dir = await seedSession(PROJECT, 'session-x')
+  const { ctx, state } = makeContext()
+  const deleted = []
+  const baseGet = ctx.get
+  ctx.get = (key) =>
+    key === 'schedule'
+      ? {
+          async catalog() {
+            return [
+              { id: 'task-mine', sessionId: 'session-x', status: 'inactive' },
+              { id: 'task-other', sessionId: 'session-other', status: 'active' },
+            ]
+          },
+          async delete(request) {
+            deleted.push(request)
+            return { id: request.id, deleted: true }
+          },
+        }
+      : baseGet(key)
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200)
+  assert.deepEqual(deleted, [{ id: 'task-mine', sessionId: 'session-x' }], 'only the deleted Session’s tasks go')
+  assert.equal(payload.scheduledTasksRemoved, 1, 'the response must report how many reminders went with it')
+  await rm(dir, { recursive: true, force: true })
+}
+
+{
+  // A reminder the schedule service refuses to delete is reported, never fatal:
+  // the artifact is already gone by the time this runs.
+  const dir = await seedSession(PROJECT, 'session-x')
+  const { ctx, state } = makeContext()
+  const baseGet = ctx.get
+  ctx.get = (key) =>
+    key === 'schedule'
+      ? {
+          async catalog() {
+            return [{ id: 'task-stuck', sessionId: 'session-x', status: 'active' }]
+          },
+          async delete() {
+            throw new Error('schedule store is read-only')
+          },
+        }
+      : baseGet(key)
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200, 'a reminder that cannot be deleted must not fail the deletion')
+  assert.equal(payload.scheduledTasksRemoved, 0)
+  assert.match(payload.cleanupWarnings[0], /^schedule task-stuck:/u)
+  await rm(dir, { recursive: true, force: true })
+}
+
+{
   const dir = await seedSession(PROJECT, 'session-x')
   const { ctx, state } = makeContext({ running: true })
   host.apply(ctx)
