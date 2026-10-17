@@ -90,13 +90,15 @@ the plugin's reach:
 honest, but the live store in a real deployment (the desktop app with its bundles
 mounted) can answer for *every* Session a user can see, which made the rule "refuse
 everything" — the plugin could not delete anything at all. A rule that cannot
-delete anything is not honesty, it is a bug. So the delete proceeds, the response
-carries `liveInMemory` and `liveSource`, and the dialog warns **before** the user
-confirms that the row can return:
+delete anything is not honesty, it is a bug. So the delete proceeds and the
+response carries `liveInMemory` and `liveSource` for diagnostics.
 
-> This session is live in the running process: the log will be deleted, but the
-> row may come back until you refresh or reconnect (a Harness restart removes it
-> for good).
+**1.2.2 stopped showing it in the UI.** Keeping a session warm is the ordinary
+state of the app, so warning about it on every delete was noise: the dialog now
+closes exactly like a delete of a cold Session, and only stops on a real failure
+(a subagent that could not be removed, a cleanup step that errored). The fields
+stay in the response because they answer "why did this row come back?" in a bug
+report.
 
 Only **running** work still refuses — the one case where a writer really is
 holding the artifact.

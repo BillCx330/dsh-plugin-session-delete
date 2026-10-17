@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-session-delete",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Delete a Session from the sidebar's \"...\" menu — a destructive row styled with DSH's own MenuItemButton danger colors · 在会话「⋯」菜单末尾添加红色的删除会话选项",
   "keywords": [
     "dsh",

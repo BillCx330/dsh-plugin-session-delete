@@ -9,6 +9,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > commits are part of the initial history, but they were never tagged or
 > released, so `v1.2.0` is the earliest version with a release page.
 
+## [1.2.2] - 2026-10-17
+
+### Changed
+
+- **Liveness is no longer surfaced in the UI.** 1.2.1 still warned before the
+  user confirmed and kept the dialog open afterwards whenever the Host held the
+  Session — but keeping Sessions warm is the ordinary state of the app, so every
+  single delete ended on a report that said nothing actionable. The dialog now
+  behaves like a delete of a cold Session: it closes when the deletion succeeded,
+  and only stops on a real failure (a subagent that could not be removed, a
+  cleanup step that errored).
+- `liveInMemory`/`liveSource` stay in the delete and preview responses as
+  diagnostics only, and the two now-unused locale keys (`dialog.liveWarning`,
+  `dialog.warn.live`) are gone from both dictionaries and both `.d.ts` files.
+
+### Verified against DeepSeek Harness 0.2.1-rc.2
+
+- No breaking change in any interface this plugin uses. Checked against the
+  shipped `0.2.1-rc.2` bundles: `connection.fetch.register` still takes
+  `{ path, methods, requestBody, fetch }`; `sessionPersistence.locate/stat/root`
+  and the `_no-cwd` project layout are unchanged; `sessionQuery.traceSession`
+  keeps its `{ session, descendants }` shape; `workspaceRegistry`
+  `unpinSession`/`unarchiveSession`/`detachSession`/`sessionIds` are unchanged;
+  `storageDomain…table('sessions').delete(id)` still resolves `false` for an
+  absent key; `workspace/session-activity` and the `api-session/removed` forward
+  are unchanged; the Session format is still v4; and `sessions.get`/`agents.get`
+  still answer as before.
+- `@deepseek-ai/dsh-client-ui-primitives` and `dsh-client-ui-slots` are no longer
+  shipped as separate packages, but every shipped client bundle still
+  `require("@deepseek-ai/dsh-client-ui-primitives")` — it is a platform seed word
+  now. The plugin's `require` is therefore still correct, and
+  `MenuItemButton`/`Modal`/`Button`/`IconTrashOutlineRegular` remain exported,
+  with `sidebar.workspaces.session.menu.item` (list/root) and `shell.overlay`
+  (list/root) still declared.
+- The new version still ships no Session deletion of its own (the only
+  `session/delete` is the ACP SDK's client protocol), so the plugin is not
+  redundant or conflicting.
+
 ## [1.2.1] - 2026-10-16
 
 ### Fixed
@@ -250,5 +288,6 @@ First release.
   root before anything is removed.
 - Live/attached sessions are refused rather than force-deleted.
 
+[1.2.2]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.2.2
 [1.2.1]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.2.1
 [1.2.0]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.2.0
