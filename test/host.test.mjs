@@ -6,6 +6,7 @@
  * most importantly — that removal only ever happens for a directory provably
  * owned by the requested Session. No real profile storage is touched.
  */
+import { existsSync } from 'node:fs'
 import { mkdtemp, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -31,7 +32,21 @@ async function seedSession(project, sessionId) {
 }
 
 /** Build a Host context over one fake deployment shape. */
-function makeContext({ live = false, running = false, locate = true, outsidePath, failDetach = false, failUnpin = false, descendants = [], probeThrows = false, cacheDeleteReturns = true } = {}) {
+function makeContext({
+  live = false,
+  running = false,
+  locate = true,
+  outsidePath,
+  failDetach = false,
+  failUnpin = false,
+  descendants = [],
+  probeThrows = false,
+  cacheDeleteReturns = true,
+  missing = [],
+  detachable = false,
+  agentStatus,
+  scanThrows = false,
+} = {}) {
   const state = {
     detached: [],
     unpinned: [],
@@ -40,17 +55,45 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
     cacheDropped: [],
     activityQueries: 0,
     traceIds: [],
+    listCalls: 0,
+    evicted: [],
+    flushCalls: 0,
+    logExistedAtDetach: undefined,
     route: undefined,
     previewRoute: undefined,
   }
 
+  // The Host's live store: a Session is present while it has been entered. With
+  // `detachable`, the two eviction primitives the session service really exposes
+  // are present, so the plugin can take the Session out instead of only
+  // reporting it.
+  const liveSessions = new Map()
+  if (live) {
+    for (const id of ['session-live', 'session-zombie']) liveSessions.set(id, { id })
+  }
   const sessions = {
-    // `session-zombie` is held live but has no stored artifact: the case where
-    // a sidebar row outlives its storage and returns after a reconnect.
-    get: (id) => (live && (id === 'session-live' || id === 'session-zombie') ? { id } : undefined),
+    get: (id) => liveSessions.get(id),
+    ...(detachable
+      ? {
+          liveEntryFor(session) {
+            return { id: session.id, session }
+          },
+          detachEntered(entry) {
+            // Ordering evidence: the artifact must still be on disk at this point.
+            state.logExistedAtDetach = existsSync(join(root, PROJECT, entry.id, 'session.v4.jsonl.zstd'))
+            liveSessions.delete(entry.id)
+            state.evicted.push(entry.id)
+          },
+        }
+      : {}),
   }
 
-  const agents = { get: () => undefined }
+  const agents = {
+    get: (id) =>
+      agentStatus === undefined || (id !== 'session-x' && !liveSessions.has(id))
+        ? undefined
+        : { id, status: agentStatus },
+  }
 
   // The shipped archive path asks `workspace/session-activity` what is still
   // running on a Session; the plugin uses that same read-only probe, so the
@@ -60,8 +103,13 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
   const persistence = {
     root,
     async stat(id) {
-      if (id === 'session-missing' || id === 'session-zombie') return undefined
+      if (id === 'session-missing' || id === 'session-zombie' || missing.includes(id)) return undefined
       return { header: { id, cwd: CWD, version: 4, createdAt: 0, isSeeded: false } }
+    },
+    // Durability barrier the real backend exposes (`tracker.flushAll()`), called
+    // after a Session is evicted so a late flush cannot recreate its log.
+    async flush() {
+      state.flushCalls += 1
     },
     ...(locate
       ? {
@@ -128,12 +176,27 @@ function makeContext({ live = false, running = false, locate = true, outsidePath
           return persistence
         case 'sessionQuery':
           return {
-            // Lineage shape mirrors the real service: nested `descendants`,
-            // each node a `SessionRecord` whose header carries `origin` AND the
-            // `cwd` the artifact is really stored under (`traceSession` clones
-            // the whole record, so a real node always has one). A fixture that
-            // dropped the cwd would make the cascade look correct here while
-            // failing against the shipped backend.
+            // The 0.2.1 public surface: the plugin scans the corpus by
+            // `parentSession` instead of tracing from the parent, so children are
+            // still found when the parent itself is gone. Each record carries the
+            // header (with `origin` and the `cwd` the artifact is really stored
+            // under); a fixture that dropped the cwd would make the cascade look
+            // correct here while failing against the shipped backend.
+            async listSessions() {
+              state.listCalls += 1
+              if (scanThrows) throw new Error('session corpus is unreadable')
+              const records = []
+              const walk = (nodes) => {
+                for (const node of nodes ?? []) {
+                  if (node?.session?.header) records.push({ header: node.session.header })
+                  walk(node?.descendants)
+                }
+              }
+              walk(descendants)
+              return records
+            },
+            // Older compositions expose only the trace; kept so the fallback is
+            // covered rather than assumed.
             async traceSession(id) {
               state.traceIds.push(id)
               return { target: { header: { id: 'session-x', cwd: CWD } }, ancestors: [], descendants }
@@ -275,6 +338,82 @@ async function post(route, body) {
   assert.deepEqual(state.detached, ['session-live'], 'the workspace slot must be released')
   assert.deepEqual(state.emitted, [['api-session/removed', 'session-live']], 'the row must be announced')
   assert.equal(state.activityQueries > 0, true, 'the activity probe is still asked')
+}
+
+{
+  // When the session service exposes its eviction primitives, the live Session is
+  // taken OUT of the store before its artifact is removed. That is what makes the
+  // delete stick: `listSessions` unions live Sessions, so a Session left resident
+  // would return on the next list rebuild with no log behind it.
+  //
+  // Ordering is the point: the artifact must still exist when the eviction runs
+  // (otherwise a late flush could recreate the log), and the durability barrier
+  // must run before the removal.
+  const dir = await seedSession(PROJECT, 'session-live')
+  const { ctx, state } = makeContext({ live: true, detachable: true })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-live' })
+  assert.equal(status, 200)
+  assert.deepEqual(state.evicted, ['session-live'], 'the live Session must be evicted')
+  assert.equal(state.logExistedAtDetach, true, 'eviction must happen while the artifact is still on disk')
+  assert.equal(state.flushCalls > 0, true, 'pending writes must be drained before the removal')
+  assert.equal(payload.liveDetached, true, 'the response must report the eviction')
+  assert.equal(payload.liveInMemory, false, 'after eviction the Host no longer holds it')
+  assert.equal(await stat(dir).then(() => true, () => false), false, 'the artifact must be gone')
+  assert.deepEqual(state.emitted, [['api-session/removed', 'session-live']], 'the removal is still announced')
+}
+
+{
+  // A Session whose agent reports a running turn is never evicted: detaching it
+  // would leave the turn appending to a session the Host no longer publishes.
+  // The activity probe is the primary gate; this is the second one, and it fires
+  // when the turn started between the probe and the eviction.
+  const dir = await seedSession(PROJECT, 'session-live')
+  const { ctx, state } = makeContext({ live: true, detachable: true, agentStatus: 'running' })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-live' })
+  assert.equal(status, 409, 'a running agent must refuse the eviction')
+  assert.equal(payload.code, 'running')
+  assert.deepEqual(state.evicted, [], 'nothing may be evicted')
+  assert.equal(await stat(dir).then(() => true), true, 'the artifact must survive')
+}
+
+{
+  // The artifact can vanish between `stat` and the removal (a concurrent delete,
+  // or something outside the plugin). The goal state holds, so this answers like
+  // an already-gone Session instead of failing a request that changed nothing.
+  const { ctx, state } = makeContext()
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200, 'an artifact that vanished mid-delete is not a failure')
+  assert.equal(payload.alreadyGone, true)
+  assert.equal(payload.artifactRemoved, false)
+  assert.equal(payload.announced, true, 'the row must still be dismissed')
+  assert.deepEqual(state.emitted, [['api-session/removed', 'session-x']])
+}
+
+{
+  // The orphan shape an earlier version created: the parent's artifact is gone and
+  // its subagent children are still on disk. `traceSession` cannot see them (it
+  // needs the parent), but the corpus scan by `parentSession` can, so the
+  // already-gone path removes them too.
+  const childDir = await seedSession(PROJECT, 'sub-orphan')
+  const tree = [{ session: { header: { id: 'sub-orphan', cwd: CWD, origin: 'subagent', parentSession: 'session-x' } }, descendants: [] }]
+  const { ctx, state } = makeContext({ missing: ['session-x'], descendants: tree })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200)
+  assert.equal(payload.alreadyGone, true)
+  assert.deepEqual(payload.subagentsRemoved, ['sub-orphan'], 'a gone parent must still cascade')
+  assert.equal(await stat(childDir).then(() => true, () => false), false, 'the orphan must be gone')
+  assert.deepEqual(state.emitted, [
+    ['api-session/removed', 'sub-orphan'],
+    ['api-session/removed', 'session-x'],
+  ], 'the child is announced before the parent')
 }
 
 {
@@ -516,7 +655,8 @@ async function post(route, body) {
 
   const { status, payload } = await post(state.route, { sessionId: 'session-x' })
   assert.equal(status, 200)
-  assert.deepEqual(state.traceIds, ['session-x'], 'the trace must be asked about the Session being deleted')
+  assert.equal(state.listCalls > 0, true, 'descendants must come from a corpus scan of parentSession')
+  assert.deepEqual(state.traceIds, [], 'the corpus scan replaces tracing from the parent')
   assert.deepEqual(payload.subagentsRemoved, ['sub-a', 'sub-a1'], 'every subagent descendant must go with its parent, depth-first')
   for (const id of ['session-x', 'sub-a', 'sub-a1']) {
     await assert.rejects(() => stat(join(root, PROJECT, id)), `${id} must be gone`)
@@ -560,8 +700,8 @@ async function post(route, body) {
   await seedSession(PROJECT, 'session-x')
   await seedSession(PROJECT, 'sub-ok')
   const tree = [
-    { session: { header: { id: 'sub-missing', cwd: CWD, origin: 'subagent' } }, descendants: [] },
-    { session: { header: { id: 'sub-ok', cwd: CWD, origin: 'subagent' } }, descendants: [] },
+    { session: { header: { id: 'sub-missing', cwd: CWD, origin: 'subagent', parentSession: 'session-x' } }, descendants: [] },
+    { session: { header: { id: 'sub-ok', cwd: CWD, origin: 'subagent', parentSession: 'session-x' } }, descendants: [] },
   ]
   const { ctx, state } = makeContext({ descendants: tree })
   host.apply(ctx)
@@ -622,7 +762,7 @@ async function post(route, body) {
   // The preview route is read-only and reports the blast radius.
   await seedSession(PROJECT, 'session-x')
   const tree = [
-    { session: { header: { id: 'sub-a', cwd: CWD, origin: 'subagent' } }, descendants: [] },
+    { session: { header: { id: 'sub-a', cwd: CWD, origin: 'subagent', parentSession: 'session-x' } }, descendants: [] },
     { session: { header: { id: 'fork-top', cwd: CWD, parentSession: 'session-x' } }, descendants: [] },
   ]
   const { ctx, state } = makeContext({ descendants: tree })
@@ -798,5 +938,39 @@ async function post(route, body) {
 }
 
 await rm(root, { recursive: true, force: true })
+
+{
+  // A corpus that cannot be read is not evidence that there are no children. The
+  // artifact-present path must abort BEFORE touching anything, or a parent gets
+  // deleted while its subagents stay behind — the orphan shape this plugin exists
+  // to prevent.
+  const dir = await seedSession(PROJECT, 'session-x')
+  const tree = [{ session: { header: { id: 'sub-x', cwd: CWD, origin: 'subagent', parentSession: 'session-x' } }, descendants: [] }]
+  const childDir = await seedSession(PROJECT, 'sub-x')
+  const { ctx, state } = makeContext({ descendants: tree, scanThrows: true })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 500, 'an unreadable corpus must abort the deletion')
+  assert.match(payload.message, /could not enumerate subagent descendants/u)
+  assert.equal(await stat(dir).then(() => true), true, 'the parent must survive')
+  assert.equal(await stat(childDir).then(() => true), true, 'and so must the child')
+  assert.deepEqual(state.emitted, [], 'nothing may be announced')
+
+  await rm(dir, { recursive: true, force: true })
+  await rm(childDir, { recursive: true, force: true })
+}
+
+{
+  // On the already-gone path the row still has to be dismissed, so a failed scan is
+  // a warning instead of a failure — but it is never silent.
+  const { ctx, state } = makeContext({ missing: ['session-x'], scanThrows: true })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200, 'a stale row must still be dismissable')
+  assert.equal(payload.alreadyGone, true)
+  assert.match(payload.cleanupWarnings[0], /could not enumerate subagent descendants/u)
+}
 
 console.log('host half: all behavioural checks passed')

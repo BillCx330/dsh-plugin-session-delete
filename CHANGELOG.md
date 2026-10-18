@@ -9,6 +9,62 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > commits are part of the initial history, but they were never tagged or
 > released, so `v1.2.0` is the earliest version with a release page.
 
+## [1.3.0] - 2026-10-18
+
+A line-by-line re-audit of the deletion logic, compared against
+[`Ycet/dsh-archive-manager`](https://github.com/Ycet/dsh-archive-manager) (which
+deletes DSH Sessions a different way) and against the shipped 0.2.1-rc.2 bundles.
+Everything below is a gap the audit found, not a new feature.
+
+### Fixed — under-deletion
+
+- **A live Session is now evicted, not just reported.** `ApiSessionList.list()`
+  unions live Sessions with persisted ones, so a Session left resident in the store
+  came back on the next list rebuild after its artifact was gone, and its writes
+  then failed. The plugin now uses the session service's own primitives
+  (`liveEntryFor` → `detachEntered`, which emits `session/disposed` →
+  `api-session/removed`) before removing anything, then drains pending writes
+  (`sessionPersistence.flush()`) so a late flush cannot recreate the log. Ordering
+  is load-bearing — activity probe → evict → remove — and `liveDetached` reports
+  whether it happened.
+- **An already-gone parent now cascades.** The already-gone path used to finish the
+  parent's bookkeeping and return, leaving its subagent children stranded — the
+  exact orphan shape 1.2.0 was meant to prevent. It now removes them too.
+- **Descendants are discovered by scanning `parentSession`, not by tracing from the
+  parent.** `traceSession` throws when the target is absent from the corpus, which
+  is precisely the case that strands children. The corpus scan
+  (`sessionQuery.listSessions()`) finds them even when the parent is gone, and is
+  breadth-first and cycle-safe. `traceSession` stays as a fallback for compositions
+  that expose only the trace.
+- **Each child now gets the same bookkeeping as a top-level Session** — workspace
+  release, cache row, reminders, announcement — instead of only the cache row and
+  the announcement.
+- **A corpus read that fails aborts the deletion** instead of being read as "no
+  children", which would have deleted a parent and left orphans. On the already-gone
+  path it is a cleanup warning, because the stale row still has to be dismissable.
+
+### Fixed — wrong outcomes
+
+- **An artifact that vanishes between `stat` and the removal is an idempotent
+  success**, not a 500. A concurrent delete or an external `rm` used to produce "the
+  Session artifact is no longer on disk, so nothing was changed" for a request whose
+  goal was already met; it now finishes like an already-gone Session.
+- **A Session that starts running mid-delete answers 409 `running`**, not 500 — the
+  condition is retryable and matches the first gate.
+
+### Verified against the reference implementation
+
+`dsh-archive-manager` deletes only archived Sessions, gates on `stat`, and — the
+part this release adopts — evicts a live Session with
+`liveEntryFor`/`detachEntered` before `rm`, refusing only agents whose status is
+literally `running`. Its guards are weaker than ours (no root containment, no
+`lstat`/symlink check, no sibling protection beyond a basename check), and it does
+not cascade to subagents, purge reminders, or reconcile the cache; it also leaves
+attachments, the search index and empty project directories alone. This plugin now
+handles the live case the same way and covers strictly more durable state. Both
+deliberately leave attachment objects (content-addressed and shareable) and DSH's own
+spill files (swept by DSH after `cleanupPeriodDays`) to their owners.
+
 ## [1.2.3] - 2026-10-18
 
 ### Added
@@ -310,6 +366,7 @@ First release.
   root before anything is removed.
 - Live/attached sessions are refused rather than force-deleted.
 
+[1.3.0]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.3.0
 [1.2.3]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.2.3
 [1.2.2]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.2.2
 [1.2.1]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.2.1
