@@ -78,6 +78,12 @@ function makeContext({
           liveEntryFor(session) {
             return { id: session.id, session }
           },
+          // The documented per-Session durability barrier (`ctx.sessions.flush`),
+          // which the plugin now prefers over the backend-wide
+          // `sessionPersistence.flush()`.
+          async flush() {
+            state.flushCalls += 1
+          },
           detachEntered(entry) {
             // Ordering evidence: the artifact must still be on disk at this point.
             state.logExistedAtDetach = existsSync(join(root, PROJECT, entry.id, 'session.v4.jsonl.zstd'))
@@ -435,8 +441,9 @@ async function post(route, body) {
 {
   // A live AGENT is enough on its own: the two stores the agent factory enters
   // are `sessions` and `agents`, and a Session can be held by the agent registry
-  // while `sessions.get` has nothing. Dropping the `agents.get` half of the check
-  // must fail here, and `liveSource` must name the store that matched.
+  // while `sessions.get` has nothing. The two facts are reported separately now:
+  // an agent does NOT put the row back into `listSessions`, so `liveInMemory`
+  // stays false while `liveAgent` names the remaining holder.
   const dir = await seedSession(PROJECT, 'session-x')
   const { ctx, state } = makeContext()
   const baseGet = ctx.get
@@ -446,7 +453,8 @@ async function post(route, body) {
   const { status, payload } = await post(state.route, { sessionId: 'session-x' })
   assert.equal(status, 200, 'an agent-held Session must still be deletable')
   assert.equal(payload.artifactRemoved, true)
-  assert.equal(payload.liveInMemory, true)
+  assert.equal(payload.liveInMemory, false, 'the live store does not hold it, so the row cannot return')
+  assert.equal(payload.liveAgent, true, 'the agent registry still references it')
   assert.equal(payload.liveSource, 'agents', 'the agent registry is the store that held it')
   assert.equal(await stat(dir).then(() => true, () => false), false)
   assert.deepEqual(state.emitted, [['api-session/removed', 'session-x']])
@@ -473,6 +481,7 @@ async function post(route, body) {
   assert.equal(await stat(dir).then(() => true), true, 'the artifact must survive a failed re-check')
   assert.deepEqual(state.detached, [])
   assert.deepEqual(state.emitted, [])
+  assert.deepEqual(state.evicted, [], 'a failed re-check must run before the eviction')
 
   await rm(dir, { recursive: true, force: true })
 }
@@ -971,6 +980,190 @@ await rm(root, { recursive: true, force: true })
   assert.equal(status, 200, 'a stale row must still be dismissable')
   assert.equal(payload.alreadyGone, true)
   assert.match(payload.cleanupWarnings[0], /could not enumerate subagent descendants/u)
+}
+
+{
+  // A refusal must mutate NOTHING — including the live store. The guard used to
+  // run after the eviction, so a refused removal had already dropped the row in
+  // every client and orphaned the Session's agent. The Session here is live and
+  // detachable, which is the shape that made the old ordering observable.
+  const outside = await mkdtemp(join(tmpdir(), 'dsh-session-delete-outside-'))
+  const victim = join(outside, 'session-live')
+  await mkdir(victim, { recursive: true })
+  await writeFile(join(victim, 'keep-me'), 'x')
+
+  const { ctx, state } = makeContext({
+    live: true,
+    detachable: true,
+    outsidePath: join(victim, 'session.v4.jsonl.zstd'),
+  })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-live' })
+  assert.equal(status, 500)
+  assert.equal(payload.code, 'failed')
+  assert.match(payload.message, /\(guard\)/u)
+  assert.equal(await stat(join(victim, 'keep-me')).then(() => true), true, 'a refused path must survive')
+  assert.deepEqual(state.evicted, [], 'a guard refusal must not evict the Session')
+  assert.deepEqual(state.emitted, [], 'a guard refusal must not announce a removal')
+  assert.deepEqual(state.detached, [], 'a guard refusal must not release the workspace slot')
+  assert.deepEqual(state.cacheDropped, [], 'a guard refusal must not drop the cache row')
+
+  await rm(outside, { recursive: true, force: true })
+}
+
+{
+  // The same zero-mutation rule for a missing `root`: without one the plugin
+  // cannot prove containment, so it refuses instead of trusting a bare basename.
+  const dir = await seedSession(PROJECT, 'session-x')
+  const { ctx, state } = makeContext()
+  const baseGet = ctx.get
+  ctx.get = (key) => {
+    if (key !== 'sessionPersistence') return baseGet(key)
+    const base = baseGet(key)
+    return { ...base, root: undefined }
+  }
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 500, 'a backend that cannot name its root must be refused')
+  assert.match(payload.message, /\(guard\)/u)
+  assert.equal(await stat(dir).then(() => true), true, 'the artifact must survive')
+  assert.deepEqual(state.emitted, [])
+
+  await rm(dir, { recursive: true, force: true })
+}
+
+{
+  // A Session whose log is already gone can still be RUNNING. Announcing it as
+  // removed, releasing its workspace slot and purging its reminders while its
+  // turn keeps writing is the same mistake as deleting under the writer, only
+  // quieter — so the activity gate applies to the already-gone path too.
+  const { ctx, state } = makeContext({ missing: ['session-x'], running: true })
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 409, 'running work must refuse even when the artifact is already gone')
+  assert.equal(payload.code, 'running')
+  assert.deepEqual(state.emitted, [], 'a running Session must not be announced as removed')
+  assert.deepEqual(state.detached, [])
+  assert.deepEqual(state.unpinned, [])
+  assert.deepEqual(state.cacheDropped, [])
+}
+
+{
+  // An armed reminder is deleted WITH the Session, not a veto. `dsh-schedule`
+  // reports one `kind: 'schedule'` entry per active task, so treating every
+  // non-empty activity list as "running" made a Session with a reminder
+  // undeletable and left the reminder purge unreachable.
+  const dir = await seedSession(PROJECT, 'session-x')
+  const { ctx, state } = makeContext()
+  const deleted = []
+  const baseGet = ctx.get
+  ctx.get = (key) =>
+    key === 'schedule'
+      ? {
+          async catalog() {
+            return [
+              { id: 'task-1', sessionId: 'session-x', status: 'active' },
+              { id: 'task-2', sessionId: 'other', status: 'active' },
+            ]
+          },
+          async delete(request) {
+            deleted.push(request)
+            return { id: request.id, deleted: true }
+          },
+        }
+      : baseGet(key)
+  const baseWaterfall = ctx.waterfall
+  ctx.waterfall = async (event, request, next) =>
+    request.sessionId === 'session-x'
+      ? [{ kind: 'schedule', items: [{ id: 'task-1' }] }]
+      : baseWaterfall(event, request, next)
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: 'session-x' })
+  assert.equal(status, 200, 'an armed reminder must be cleaned up, not block the delete')
+  assert.equal(payload.scheduledTasksRemoved, 1)
+  assert.deepEqual(deleted, [{ id: 'task-1', sessionId: 'session-x' }])
+  await assert.rejects(() => stat(dir))
+}
+
+{
+  // The backend names session directories with `encodeSegment(id)`, so a space
+  // in an id becomes `~0020`. Comparing the final path segment to the raw id
+  // refused every such Session forever; identity against `locate()` is the
+  // proof that works for every encoding.
+  const id = 'session with space'
+  const encoded = 'session~0020with~0020space'
+  const dir = join(root, PROJECT, encoded)
+  await mkdir(dir, { recursive: true })
+  await writeFile(join(dir, 'session.v4.jsonl.zstd'), 'x')
+
+  const { ctx, state } = makeContext()
+  const baseGet = ctx.get
+  ctx.get = (key) => {
+    if (key !== 'sessionPersistence') return baseGet(key)
+    const base = baseGet(key)
+    return {
+      ...base,
+      locate: () => ({ kind: 'jsonl', path: join(root, PROJECT, encoded, 'session.v4.jsonl.zstd') }),
+    }
+  }
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.route, { sessionId: id })
+  assert.equal(status, 200, 'an id the backend encodes must still be deletable')
+  assert.equal(payload.artifactRemoved, true)
+  await assert.rejects(() => stat(dir), 'the encoded directory must be gone')
+}
+
+{
+  // The dialog has to say that reminders go with the Session, so the preview
+  // reports their count — and only the ones bound to this Session.
+  await seedSession(PROJECT, 'session-x')
+  const { ctx, state } = makeContext()
+  const baseGet = ctx.get
+  ctx.get = (key) =>
+    key === 'schedule'
+      ? {
+          async catalog() {
+            return [
+              { id: 'task-1', sessionId: 'session-x', status: 'active' },
+              { id: 'task-2', sessionId: 'session-x', status: 'inactive' },
+              { id: 'task-3', sessionId: 'other', status: 'active' },
+            ]
+          },
+        }
+      : baseGet(key)
+  host.apply(ctx)
+
+  const { status, payload } = await post(state.previewRoute, { sessionId: 'session-x' })
+  assert.equal(status, 200)
+  assert.equal(payload.scheduledTaskCount, 2, 'both task states are bound to the Session and both are deleted')
+  assert.deepEqual(payload.subagentIds, [])
+
+  await rm(join(root, PROJECT, 'session-x'), { recursive: true, force: true })
+}
+
+{
+  // Two requests for one Session (a double click, two clients) share one
+  // operation. Running the pipeline twice would announce the removal twice,
+  // re-delete the reminders into `cleanupWarnings`, and race the first `rm`.
+  await seedSession(PROJECT, 'session-x')
+  const { ctx, state } = makeContext()
+  host.apply(ctx)
+
+  const [first, second] = await Promise.all([
+    post(state.route, { sessionId: 'session-x' }),
+    post(state.route, { sessionId: 'session-x' }),
+  ])
+
+  assert.equal(first.status, 200)
+  assert.equal(second.status, 200, 'the second caller must receive the shared outcome')
+  assert.deepEqual(first.payload, second.payload)
+  assert.deepEqual(state.emitted, [['api-session/removed', 'session-x']], 'the removal must be announced once')
+  assert.equal(state.listCalls, 1, 'the corpus must be scanned once, not once per caller')
 }
 
 console.log('host half: all behavioural checks passed')

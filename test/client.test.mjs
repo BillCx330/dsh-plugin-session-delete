@@ -171,7 +171,7 @@ const overlay = registrations.find((r) => r.declaration.name === 'shell.overlay'
 assert.ok(menu, 'the Session "..." menu seat must be filled')
 assert.ok(overlay, 'the confirmation dialog must live in the shell overlay')
 
-assert.equal(menu.declaration.id, 'session-delete')
+assert.equal(menu.declaration.id, 'dsh.session-delete', 'the row id must be package-namespaced')
 assert.equal(menu.declaration.order, 500, 'order 500 places the row after the shipped Archive (400)')
 assert.equal(menu.declaration.locale, 'session-delete')
 
@@ -209,13 +209,13 @@ assert.deepEqual(
 
 /* --------------------------------------------------------- the dialog --- */
 
-// A preview reporting two subagent sessions, so the dialog's blast-radius note
-// has something real to render.
-const previewIds = ['sub-1', 'sub-2']
+// A preview reporting two subagent sessions and one armed reminder, so both
+// blast-radius notes have something real to render.
+const previewCounts = { subagents: 2, reminders: 1 }
 const previewCalls = []
 const facePreview = async (sessionId) => {
   previewCalls.push(sessionId)
-  return previewIds
+  return previewCounts
 }
 
 resetHooks()
@@ -258,9 +258,13 @@ const noteKeys = modalWithPreview.props.children
   .filter((child) => child !== null && child !== undefined)
   .map((child) => child.props.key)
 assert.ok(noteKeys.includes('subagents'), 'the subagent blast-radius note must render when there are subagents')
+assert.ok(noteKeys.includes('reminders'), 'the reminder blast-radius note must render when reminders will be deleted')
 assert.ok(noteKeys.includes('forks'), 'the fork-survival note must always render')
 const subagentNote = modalWithPreview.props.children.find((child) => child !== null && child.props?.key === 'subagents')
 assert.equal(subagentNote.props.role, 'note')
+assert.deepEqual(subagentNote.children, ['dialog.subagents'])
+const reminderNote = modalWithPreview.props.children.find((child) => child !== null && child.props?.key === 'reminders')
+assert.deepEqual(reminderNote.children, ['dialog.reminders'])
 
 const footer = modalElement.props.footer
 assert.equal(footer.type, React.Fragment)
@@ -314,18 +318,30 @@ assert.equal(face.hooks.deletePending.getSnapshot(), null)
   const previewCalls = []
   globalThis.fetch = async (url, init) => {
     previewCalls.push({ url, init })
-    return { ok: true, json: async () => ({ ok: true, subagentIds: ['a', 'b'], live: true, liveSource: 'agents' }) }
+    return {
+      ok: true,
+      json: async () => ({ ok: true, subagentIds: ['a', 'b'], scheduledTaskCount: 3, live: true, liveSource: 'agents' }),
+    }
   }
 
   assert.deepEqual(
     await face.preview('session-abc'),
-    ['a', 'b'],
-    'the real preview hop must return the ids',
+    { subagents: 2, reminders: 3 },
+    'the real preview hop must return both counts',
   )
   assert.equal(previewCalls.length, 1)
   assert.equal(previewCalls[0].url, '/api/session.delete.preview', 'the preview must never call the destructive route')
   assert.equal(previewCalls[0].init.method, 'POST')
   assert.deepEqual(JSON.parse(previewCalls[0].init.body), { sessionId: 'session-abc' })
+
+  // An older Host reports subagents but not reminders: that is "unknown", not
+  // zero, so the dialog must not claim there is nothing else to delete.
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true, subagentIds: [] }) })
+  assert.deepEqual(
+    await face.preview('session-abc'),
+    { subagents: 0, reminders: null },
+    'a Host without scheduledTaskCount must read as "unknown reminders"',
+  )
 
   globalThis.fetch = async () => ({
     ok: false,
@@ -363,6 +379,16 @@ globalThis.fetch = async () => {
   throw new Error('offline')
 }
 await assert.rejects(() => face.deleteSession('session-abc'), (error) => error.code === 'network')
+
+// A Host that accepts the request but never answers must not leave the dialog
+// on "Deleting…" forever. The deadline is client-side: the copy says the
+// Session may already be gone, so the user refreshes instead of retrying blind.
+globalThis.fetch = async () => {
+  const timeout = new Error('timed out')
+  timeout.name = 'TimeoutError'
+  throw timeout
+}
+await assert.rejects(() => face.deleteSession('session-abc'), (error) => error.code === 'timeout')
 
 /* ------------------------- unknown failure codes degrade to a sentence --- */
 
@@ -443,11 +469,11 @@ for (const [code, expected] of [
 
   face.requestSessionDelete('session-warn', 'A title')
   resetHooks()
-  let form = render(deleteSession, async () => [])
+  let form = render(deleteSession, async () => ({ subagents: 0, reminders: 0 }))
   await form.props.footer.children[1].props.onClick()
   await new Promise((resolve) => setTimeout(resolve, 0))
   React.__cursor = 0
-  form = render(deleteSession, async () => [])
+  form = render(deleteSession, async () => ({ subagents: 0, reminders: 0 }))
 
   assert.equal(settledCount, 0, 'a reported partial result must keep the dialog open')
   assert.equal(form.props.description, 'dialog.deleted', 'the dialog must say the Session is gone')
@@ -522,7 +548,7 @@ for (const [code, expected] of [
         face.settleSessionDelete()
       },
       deleteSession: async () => ({ ok: true, artifactRemoved: true, liveInMemory: true, liveSource: 'agents' }),
-      preview: async () => [],
+      preview: async () => ({ subagents: 0, reminders: 0 }),
       t: (key) => key,
     })
     return element === null ? null : element.type(element.props)
@@ -534,6 +560,82 @@ for (const [code, expected] of [
 
   assert.equal(settled, 1, 'a delete that only reports liveness must settle at once')
   assert.equal(face.hooks.deletePending.getSnapshot(), null, 'and the dialog must be gone')
+}
+
+// Two Client trees share this module (the loader materializes it once), so the
+// stylesheet is owned by both: the first tree's teardown must not strip styles
+// the second one is still rendering against.
+{
+  const before = styleTags.length
+  plugin.apply(ctx)
+  plugin.apply(ctx)
+  assert.equal(styleTags.length, before + 1, 'the second and third apply must reuse the tag')
+  const tag = styleTags.at(-1)
+  // Each apply pushes [styles, dictionaries]; dispose the two styles effects.
+  effects.at(-4).dispose()
+  assert.equal(tag.removed, false, 'the tag must survive while another tree still owns it')
+  effects.at(-2).dispose()
+  assert.equal(tag.removed, true, 'the last owner must remove the tag')
+}
+
+// The primitives are optional. A build that drops the package — or renames one
+// of its exports — must degrade to the local components instead of failing the
+// factory and blanking the slot entry (the failure mode the official authoring
+// guide warns about). The throwing require is the harshest version of that.
+{
+  const base = registrations.length
+  const fallbackPlugin = registration.factory((specifier) => {
+    if (specifier === 'react') return React
+    if (specifier === '@deepseek-ai/dsh-client-ui-primitives') throw new Error('primitives are gone')
+    return undefined
+  })
+  fallbackPlugin.apply(ctx)
+
+  const fallbackMenu = registrations
+    .slice(base)
+    .find((entry) => entry.declaration.name === 'sidebar.workspaces.session.menu.item')
+  assert.ok(fallbackMenu, 'the row must still register without the primitives')
+
+  let requested = null
+  const face = fallbackMenu.declaration.inject()
+  resetHooks()
+  const rowElement = fallbackMenu.component({
+    sessionId: 'session-fallback',
+    displayTitle: 'A title',
+    useMenuOpenState: () => [null, () => {}],
+    requestSessionDelete: (sessionId) => {
+      requested = sessionId
+    },
+    t: (key) => key,
+  })
+  const row = rowElement.type(rowElement.props)
+  assert.equal(row.type, 'div', 'the fallback row renders its own wrapper')
+  const rowButton = row.children.find((child) => child?.type === 'button')
+  assert.ok(rowButton, 'the fallback row still renders one menu button')
+  assert.equal(rowButton.props.role, 'menuitem')
+  assert.equal(rowButton.props.className.includes('dsh-session-delete-item-danger'), true, 'the row stays destructive')
+  rowButton.props.onClick()
+  assert.equal(requested, 'session-fallback', 'the fallback row still raises the request')
+
+  const fallbackOverlay = registrations
+    .slice(base)
+    .find((entry) => entry.declaration.name === 'shell.overlay')
+  face.requestSessionDelete('session-fallback', 'A title')
+  resetHooks()
+  const dialog = fallbackOverlay.component({
+    useDeletePending: (selector) => selector(face.hooks.deletePending.getSnapshot()),
+    settleSessionDelete: face.settleSessionDelete,
+    deleteSession: async () => ({ ok: true }),
+    preview: async () => ({ subagents: 0, reminders: 0 }),
+    t: (key) => key,
+  })
+  const form = dialog.type(dialog.props)
+  const modal = form.type(form.props)
+  assert.equal(modal.type, 'div', 'the fallback dialog renders an overlay instead of throwing')
+  const dialogBox = modal.children.find((child) => child?.props?.role === 'dialog')
+  assert.ok(dialogBox, 'the fallback overlay still exposes a dialog')
+  assert.equal(dialogBox.props['aria-label'], 'dialog.title')
+  face.settleSessionDelete()
 }
 
 console.log('client half: all contract checks passed')

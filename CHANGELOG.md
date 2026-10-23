@@ -9,6 +9,91 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 > commits are part of the initial history, but they were never tagged or
 > released, so `v1.2.0` is the earliest version with a release page.
 
+## [1.3.1] - 2026-10-23
+
+A correctness pass over the two paths that mutate state. Every refusal was
+re-read against the shipped 0.2.1-rc.2 sources; the theme is that a refusal must
+leave the Host exactly as it was, and only `rm` may run after the eviction.
+
+### Fixed
+
+- **A refused removal no longer evicts the Session.** The guard (`locate` +
+  root containment + `lstat`) used to run inside the removal, after
+  `detachEntered` had already dropped the Session from the live store and
+  emitted `session/disposed` → `api-session/removed`. A `guard`,
+  `not-a-directory`, `stayed` or `rm` failure therefore removed the row in every
+  client while the log stayed on disk, orphaned the Session's agent, and still
+  answered "nothing was changed". The target is now resolved and proven by
+  `resolveArtifactTarget` **before** anything is mutated; `rm` is the only step
+  that follows the eviction, and its failure says the Session was already
+  evicted so a retry finishes the job.
+- **The already-gone path honours running work.** It discarded the activity
+  refusal whenever `stat` found nothing, so a log deleted outside the plugin
+  turned a running Session into a "successful" deletion: `api-session/removed`
+  was announced, the workspace slot released and the reminders purged while the
+  turn kept writing. The refusal now applies to both paths.
+- **An armed reminder no longer makes a Session undeletable.** `dsh-schedule`
+  reports one `schedule` activity entry per active task, so the gate refused
+  every Session that had a reminder — and the cleanup that deletes those
+  reminders could never run for exactly the rows it was written for. `schedule`
+  is now excluded from `blockingActivity`: the confirmation dialog counts the
+  reminders and the deletion removes them, like it already did for inactive
+  rows.
+- **A Session whose id the backend encodes is deletable.** The guard compared
+  the directory's final segment to the raw Session id, but the JSONL backend
+  names the directory with `encodeSegment(id)` (a space becomes `~0020`), so any
+  id outside `[A-Za-z0-9._-]` was refused forever. The target must now be
+  exactly `dirname(locate(header))` — identity instead of a name comparison —
+  which is both stronger and encoding-agnostic.
+- **A backend that names no `root` is refused** instead of deleting on a
+  basename match with no containment proof.
+- **The eviction uses the per-Session barrier.** `sessions.flush(live)` (the
+  documented `session/flush` checkpoint) runs before `detachEntered`; the old
+  `sessionPersistence.flush()` drained every active write handle in the
+  deployment.
+- **A log re-materialized by the eviction is removed.** On the already-gone
+  path the disposal drain could write a log back after the eviction; one `stat`
+  afterwards catches it, and `artifactRemoved` reports what really happened.
+
+### Added
+
+- `scheduledTaskCount` on the preview response, and the `dialog.reminders`
+  locale key in both dictionaries, so the dialog states the reminder blast
+  radius before the user confirms.
+- `liveAgent` on the delete response. `liveInMemory` now means the live *store*
+  only — the one source `listSessions` unions and therefore the only one that
+  can bring a row back. An agent left behind by `detachEntered` is reported
+  separately instead of overstating that field.
+- A client-side delete deadline (`AbortSignal.timeout`, 90 s) with a localised
+  `error.timeout`, so a wedged Host no longer leaves the dialog on "Deleting…"
+  forever.
+- Six behavioural cases: guard refusal with a live+detachable Session (nothing
+  evicted), missing `root`, already-gone + running, schedule-only activity,
+  deletion of an encoded id, and the preview reminder count. Plus two-client
+  deduplication and the stylesheet owner count.
+
+### Changed
+
+- `error.running` no longer lists scheduled reminders (they are not a refusal).
+- `dialog.previewUnavailable` covers reminders as well as subagents.
+- `dialog.warn.subagents` says "may no longer be openable" instead of asserting
+  it: the reason can be `running`, where the parent can still open the child.
+- `error.failed` says the session *may* still be there, because `stayed` can
+  leave a partially removed directory.
+- Concurrency: two requests for one Session share one operation
+  (`inFlightDeletes`), so the removal is announced once and reminders are
+  deleted once.
+- The stylesheet is reference-counted, so one Client tree's teardown no longer
+  strips styles another tree still renders against.
+- Slot ids are package-namespaced (`dsh.session-delete`,
+  `dsh.session-delete.dialog`), per the authoring guide.
+- The Client's `require` of `@deepseek-ai/dsh-client-ui-primitives` is guarded.
+  The official authoring guide discourages depending on Harness Client packages
+  because their exports change without notice; the shipped components still
+  provide the native look, but a build that drops or renames one now falls back
+  to local components with the same contract and theme tokens instead of
+  failing the factory and blanking the slot entry.
+
 ## [1.3.0] - 2026-10-18
 
 A line-by-line re-audit of the deletion logic, compared against
@@ -366,6 +451,7 @@ First release.
   root before anything is removed.
 - Live/attached sessions are refused rather than force-deleted.
 
+[1.3.1]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.3.1
 [1.3.0]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.3.0
 [1.2.3]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.2.3
 [1.2.2]: https://github.com/BillCx330/dsh-plugin-session-delete/releases/tag/v1.2.2

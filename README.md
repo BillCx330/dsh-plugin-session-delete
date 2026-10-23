@@ -25,7 +25,7 @@ dsh plugin --profile web add github:BillCx330/dsh-plugin-session-delete
 | Icon | `IconTrashOutlineRegular` |
 | Confirmation | A `Modal` in `shell.overlay`, whose confirm action reuses the shipped `--dsw-alias-state-error-primary` red |
 
-**Consistent with the original style**: the row reuses `ui-primitives`' `MenuItemButton` directly — geometry, hover fill, focus ring, keyboard walk, and post-selection focus return are all the shipped component's. The red is not a hand-picked value either; it is DSH's own destructive semantic color.
+**Consistent with the original style**: the row reuses `ui-primitives`' `MenuItemButton` directly — geometry, hover fill, focus ring, keyboard walk, and post-selection focus return are all the shipped component's. The red is not a hand-picked value either; it is DSH's own destructive semantic color. The `require` is guarded: a build that drops or renames one of those exports falls back to local components with the same contract and theme tokens, so the row degrades in polish instead of disappearing from the menu.
 
 ## Why a plugin is needed
 
@@ -40,16 +40,19 @@ The Host exposes no delete verb either: `sessionPersistence` has only `create` /
 
 The Host half runs these steps in order:
 
-1. **Read the stored header** — `sessionPersistence.stat(sessionId)`. With nothing stored the Session is *already gone*: the request still succeeds and finishes the bookkeeping (see *An already-gone Session is still removable*).
-2. **Refuse a Session that still has running work** — anything reported by the shipped `workspace/session-activity` probe (the turn in progress, running subagents, background jobs, scheduled reminders) → `running`. That is the same read-only probe the archive flow asks before it refuses, so deleting a Session cannot orphan a job or leave a schedule firing at a Session that is gone. This is the only refusal, and it runs **before** anything is evicted or removed, so a refusal leaves the Host untouched. A Session that starts running *during* the delete answers `409 running` too.
+1. **Read the stored header** — `sessionPersistence.stat(sessionId)`. With nothing stored the Session is *already gone*: the request still succeeds and finishes the bookkeeping (see *An already-gone Session is still removable*), but it is still refused if work is in flight.
+2. **Refuse a Session that still has running work** — anything the shipped `workspace/session-activity` probe reports as a turn, running subagents or background jobs → `running`. That is the same read-only probe the archive flow asks before it refuses. This is the only refusal, and it runs **before** anything is evicted or removed, so a refusal leaves the Host untouched. It applies to the already-gone path too: a log deleted outside the plugin does not make a running turn safe to announce away. A Session that starts running *during* the delete answers `409 running` too.
+
+   **Armed reminders are not "work in flight".** `dsh-schedule` reports one `schedule` entry per active task, and refusing on it made a Session with a reminder impossible to delete while the cleanup below claims to delete those reminders — the refusal always won. A reminder cannot be mid-write into the Session, so it is counted in the confirmation dialog and removed in step 6 instead of blocking.
 
    A probe that **fails** fails the request rather than being read as "idle" (`archiveSession` does not swallow this waterfall either). Deletion is irreversible, so a probe that cannot answer must not be permission; the cost of failing closed is a retryable `failed`, the cost of failing open is deleting a Session that was mid-write.
 
    If the probe reports work, stop it first.
-3. **Evict the Session from the live store** — `sessions.liveEntryFor(live)` → `sessions.detachEntered(entry)`, then `sessionPersistence.flush()`. This is what makes a deletion *stick*: `ApiSessionList.list()` unions live Sessions with persisted ones, so a Session left resident returns on the next list rebuild with no log behind it; detaching also emits `session/disposed` → `api-session/removed`, dropping the row in every client. See *A live Session is evicted, then removed*.
-4. **Remove the durable artifact** — the persistence backend names its own path (`locate(header)`); the whole session directory (every `session.vN.jsonl.zst` generation) is removed. Without `locate`, the fallback scans two levels under the configured root for a directory whose name is exactly the session id.
-   **The artifact goes first among the mutating steps, and nothing else is touched until it is confirmed gone**, so every later step only finishes a deletion that already happened and a failure can never leave a half-removed session.
-5. **Then, best-effort cleanup** — a deletion that has already happened is never turned into an error by cleanup, because failing the request is what leaves the client holding a phantom row for a Session that is gone. Any problem is reported in the response as `cleanupWarnings`:
+3. **Prove the artifact directory without touching it** — the persistence backend names its own path (`locate(header)`); the plugin requires the target to be *exactly* the directory that path names and to sit strictly inside the persistence root, then `lstat`s it (a symlink or junction is refused). Identity against `locate()` — not `basename === sessionId` — is what makes a Session whose id the backend encodes (`encodeSegment`, e.g. a space becomes `~0020`) deletable. A backend that cannot name its root is refused rather than trusted.
+   **Everything that can refuse happens here, before the eviction**, so a `guard` / `missing` / `not-a-directory` answer really does leave the Host untouched.
+4. **Evict the Session from the live store** — `sessions.liveEntryFor(live)` → `sessions.flush(live)` → `sessions.detachEntered(entry)`. This is what makes a deletion *stick*: `ApiSessionList.list()` unions live Sessions with persisted ones, so a Session left resident returns on the next list rebuild with no log behind it; detaching also emits `session/disposed` → `api-session/removed`, dropping the row in every client. See *A live Session is evicted, then removed*. On the already-gone path the eviction is followed by one `stat`, because the disposal drain can materialize a log that was not there.
+5. **Remove the durable artifact** — the whole session directory (every `session.vN.jsonl.zst` generation) is removed, then re-`stat`ed to confirm it is gone. `rm` is the only step that runs after the eviction; if it fails (`stayed`, `EPERM`), the response says so and a retry finishes the job.
+6. **Then, best-effort cleanup** — a deletion that has already happened is never turned into an error by cleanup, because failing the request is what leaves the client holding a phantom row for a Session that is gone. Any problem is reported in the response as `cleanupWarnings`:
    - **Release the workspace account slot** — `unpinSession`, `unarchiveSession`, then `detachSession` on every `Workspace` **unconditionally**, removing the session from `workspace.json` for real. (`Workspace.sessionIds` is a *filtered* getter over an in-memory index the plugin does not control, so it decides what the response reports, never whether the release runs; `detachSession` is idempotent.)
    - **Remove the subagent descendants** — see *Subagents go with their parent* below. Each child gets this same cleanup.
    - **Drop the projection-cache row** — through the domain that owns it, so the in-memory table and the durable file stay coherent, rather than deleting the medium directly: `storageDomain.get('session_projcache').table('sessions').delete(id)`. `cacheRowDropped` reports the table's real answer, so an absent row is not mistaken for a dropped one.
@@ -68,7 +71,7 @@ If the corpus **cannot be read**, the artifact-present path aborts before touchi
 
 Each child is removed through **its own stored header** — with `cwd` intact. That matters: the JSONL backend names each artifact from `header.cwd` (`logPath(root, meta.cwd, meta.id)`), so a synthetic `{ id }` resolves to the backend's `_no-cwd` project, points the removal at a directory that does not exist, and leaves the real child on disk while the response claims it was removed. Each child is also evicted from the live store and re-checks its own activity immediately before its removal.
 
-**Fork branches are deliberately left alone** — they are independent copies and survive the parent intact, promoted to top-level rows in the sidebar. The confirmation dialog states both facts before anything is destroyed: how many subagents go with the Session, and that branched conversations stay.
+**Fork branches are deliberately left alone** — they are independent copies and survive the parent intact, promoted to top-level rows in the sidebar. The confirmation dialog states the whole blast radius before anything is destroyed: how many subagents go with the Session, how many reminders are deleted, and that branched conversations stay.
 
 Each subagent removal is best-effort and individually reported; one that fails stops neither the parent deletion nor the remaining children, and the report says *why* (a child whose own probe reported work is refused as `running`). Failures are shown in the dialog rather than only logged, so a cascade that did not fully happen is never presented as one that did.
 
@@ -76,13 +79,13 @@ Each subagent removal is best-effort and individually reported; one that fails s
 
 The Host keeps entered Sessions in a live store, and `ApiSessionList.list()` unions live Sessions with persisted ones. Leaving one there while deleting its artifact produces a row that comes back with no log behind it, and writes that fail. So the plugin evicts it first:
 
-- `sessions.liveEntryFor(live)` → `sessions.detachEntered(entry)` removes it from the store and emits `session/disposed`, which the session controller forwards as `api-session/removed` — the row drops in every client;
-- `sessionPersistence.flush()` drains every active write handle, so a late flush cannot recreate the log after the directory is removed;
+- `sessions.liveEntryFor(live)` → `sessions.flush(live)` drains this Session's write handle before it is detached;
+- `sessions.detachEntered(entry)` removes it from the store and emits `session/disposed`, which the session controller forwards as `api-session/removed` — the row drops in every client;
 - then the artifact goes, and the row cannot return because the Session is no longer in either source `list()` unions.
 
-Ordering is load-bearing: **activity probe → evict → remove**. A 409 must not have evicted anything, and a running turn must never be detached. `detachLiveSession` therefore re-checks `agents.get(id)?.status` after the probe and refuses if the agent is running.
+Ordering is load-bearing: **probe → prove the target → probe again → evict → remove**. A 409 or a `guard` answer must not have evicted anything, and a running turn must never be detached. `detachLiveSession` therefore re-checks `agents.get(id)?.status` immediately before the eviction and refuses if the agent is running.
 
-What the plugin *cannot* do is tear down the agent that owns an evicted Session — DSH exposes no public dispose verb, only the entry eviction above. An idle agent whose Session is no longer published is invisible; it is recycled when its fiber is. The response says whether the eviction happened (`liveDetached`) and, for a composition that exposes no eviction primitives, what the Host still holds (`liveInMemory`, `liveSource`).
+What the plugin *cannot* do is tear down the agent that owns an evicted Session — DSH exposes no public dispose verb, only the entry eviction above. An idle agent whose Session is no longer published is invisible; it is recycled when its fiber is. The response says whether the eviction happened (`liveDetached`) and, for a composition that exposes no eviction primitives, what the Host still holds (`liveInMemory` for the store, `liveAgent` for the agent registry, `liveSource` for which one matched).
 
 Older versions of this plugin refused live Sessions (1.2.0) or merely reported them (1.2.1–1.2.2). Refusing looked honest, but the live store in a real deployment can answer for *every* Session a user can see, which turned the rule into "refuse everything"; reporting still left a row that could return. Evicting is the only one of the three that actually deletes.
 
@@ -103,19 +106,21 @@ Deletion is now **idempotent**. When there is nothing stored, the request
 returns success and runs the same cleanup — release the workspace account slot,
 drop the projection-cache row, announce the removal — which is exactly what
 dismisses the row. The response reports `alreadyGone: true`, plus
-`liveInMemory` to say whether the Session is still held by the live store.
+`liveInMemory` (the live store still holds it, so the row can return on the next
+list rebuild) and `liveAgent` (an agent still references it — invisible, and it
+does not restore the row).
 
 `liveInMemory: true` is worth paying attention to: `listSessions` unions live
-sessions with persisted ones, so a Session still held in memory can reappear
+sessions with persisted ones, so a Session still held in the store can reappear
 after a reconnect even though its row was dropped. Restarting DSH clears such a
-holder. `liveInMemory: false` means the row was simply stale and is gone for
-good.
+holder. `liveAgent` is diagnostic only: `detachEntered` cannot dispose the agent,
+but an agent without a published Session puts nothing back into the list.
 
 This path stays a success even when the Session is live — the request reached a
 Session whose storage is already gone, so refusing would leave a row that no
-operation can dismiss. Instead the dialog reports `liveInMemory` after the
-delete, so the row's return on the next refresh is announced rather than
-discovered.
+operation can dismiss. The eviction still runs, so `liveInMemory` is normally
+false; only a composition without the eviction primitives can leave a row that
+comes back.
 
 ### Why the removal must be announced
 
@@ -132,14 +137,12 @@ Ungrouped is derived as `list.ids.filter(id => !accounted.has(id))` — sessions
 Removal is the one irreversible step, so the target is proven before it is touched; failing any clause is **reported, never deleted**:
 
 - the path must be absolute;
-- its final segment must be exactly the requested session id;
-- it must sit strictly inside the persistence root;
+- it must be **exactly the directory the persistence backend named** (`dirname(locate(header))`) — not merely a directory whose basename equals the id, because the backend encodes ids into one path segment (`encodeSegment`: a space becomes `~0020`);
+- it must sit strictly inside the persistence root; a backend that cannot name its root is refused rather than trusted;
 - it must be a real directory — a symlink or junction at that path is refused rather than unlinked, because a link is not evidence that this Session owns what is behind it (recursion never follows one either: both cases were measured, not assumed);
-- activity is re-checked immediately before the irreversible step — for the Session itself and for every subagent child.
+- activity is re-checked immediately before the eviction — for the Session itself and for every subagent child.
 
-The Session is evicted from the live store before that re-check matters: a Session that is resident is detached first, so a browser that promotes a Session while the delete runs is handled by the eviction rather than by a race. What remains is the ordinary TOCTOU between the final activity probe and `rm`: a turn that starts in that window is refused per child, and for the parent the artifact may be gone by then — a removal that names its real obstacle in the message (`running`, `guard`, `missing`, …).
-
-When the guard refuses, the request fails and **nothing else changes**: workspace accounting, projection cache, and the client's list all stay as they were.
+Every one of those checks runs **before the Session is evicted**, so a refusal leaves the live store, the workspace accounting, the projection cache and the client's list exactly as they were. What remains is the ordinary TOCTOU between the final probe and `rm`; a turn that starts in that window is refused per child, and the parent's artifact may be gone by then — a removal that names its real obstacle in the message (`running`, `guard`, `missing`, …). `rm` is the only step after the eviction; if it fails (`stayed`, `EPERM`), the Session is already out of the live store, so the response says so and a retry finishes the job.
 
 The route also rejects any session id containing `/`, `\`, or NUL.
 
@@ -220,11 +223,13 @@ None. It appends nothing to any session history — deleting a session removes a
 
 These are current plugin constraints, not a backlog.
 
-- **A Session with running work is refused** (turn, subagents, jobs, schedules); stop it first.
-- **A Session the Host holds live is evicted first, then deleted** — `liveDetached` says whether that happened. A composition without the eviction primitives still deletes, and reports `liveInMemory`/`liveSource` for what the next list rebuild may bring back.
+- **A Session with running work is refused** (turn, subagents, background jobs); stop it first. An armed reminder is not work in flight: it is counted in the dialog and deleted with the Session.
+- **A Session the Host holds live is evicted first, then deleted** — `liveDetached` says whether that happened. A composition without the eviction primitives still deletes, and reports `liveInMemory`/`liveAgent`/`liveSource` for what is left behind. Only `liveInMemory` can bring the row back; `liveAgent` is diagnostic.
 - **Subagent descendants are deleted with their parent**; fork branches are not — they are independent copies and stay. Both are stated in the confirmation dialog.
 - **A partial result is never presented as a clean one**: if a subagent cannot be removed, or a cleanup step fails, the dialog stays open and says which.
 - **A symlink or junction at the artifact path is refused**, not followed and not unlinked.
+- **A backend that names no root is refused** rather than deleting on a basename match alone.
+- **Deletion assumes one DSH instance per store** — the JSONL backend's kernel write lease protects writers it can see, but the plugin cannot detect another DSH process holding the same Session under one `DSH_HOME`; deleting from one instance can pull the log out from under the other.
 - **Post-deletion cleanup is best-effort**; a failure is reported in `cleanupWarnings` and the deletion still stands.
 - **A failing activity probe fails the request** (fail-closed) rather than being read as "idle"; retrying is safe.
 - **Attachments survive**, being content-addressed and potentially shared with other sessions.

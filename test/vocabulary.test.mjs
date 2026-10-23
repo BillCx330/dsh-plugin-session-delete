@@ -92,14 +92,16 @@ assert.deepEqual(declaredKeys, runtimeKeys.en, 'the declared locale keys must ma
 assert.equal(clientPlugin.NS, 'session-delete', 'the namespace the Client registers must be the declared one')
 assert.deepEqual(dictionaries[0].ns, clientPlugin.NS, 'the registered dictionary must live under that namespace')
 
-// The Client synthesizes `network` when the Host cannot be reached, so it is
-// the one `error.*` key that is deliberately NOT a Host code.
+// The Client synthesizes `network` (unreachable Host) and `timeout` (the Host
+// did not answer in time) itself, so they are the two `error.*` keys that are
+// deliberately NOT Host codes.
+const CLIENT_CODES = new Set(['network', 'timeout'])
 const hostCodes = new Set(host.SESSION_DELETE_CODES)
 for (const key of runtimeKeys.en) {
   if (!key.startsWith('error.')) continue
   const code = key.slice('error.'.length)
-  if (code === 'network') {
-    assert.ok(!hostCodes.has(code), 'error.network is Client-synthesized and must not be a Host code')
+  if (CLIENT_CODES.has(code)) {
+    assert.ok(!hostCodes.has(code), `error.${code} is Client-synthesized and must not be a Host code`)
     continue
   }
   assert.ok(hostCodes.has(code), `"${key}" must name a code the Host can actually return`)

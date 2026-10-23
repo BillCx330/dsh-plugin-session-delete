@@ -38,6 +38,7 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
       | 'dialog.title'
       | 'dialog.desc'
       | 'dialog.subagents'
+      | 'dialog.reminders'
       | 'dialog.forks'
       | 'dialog.previewUnavailable'
       | 'dialog.deleted'
@@ -53,6 +54,7 @@ declare module '@deepseek-ai/dsh-client-ui-slots' {
       | 'error.running'
       | 'error.unavailable'
       | 'error.network'
+      | 'error.timeout'
       | 'error.failed'
   }
 }
